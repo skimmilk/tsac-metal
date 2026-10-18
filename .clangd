@@ -1,0 +1,40 @@
+# Generate/update editor commands without compiling:
+# cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+# The SDK path below matches the default /Applications/Xcode.app installation.
+CompileFlags:
+  CompilationDatabase: build
+  Compiler: /usr/bin/clang++
+  Remove: [-std=*, -x, -fobjc-arc]
+  Add:
+    - -xc++
+    - -std=c++23
+    - -stdlib=libc++
+    - -isysroot
+    - /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+
+---
+If:
+  PathMatch: .*\.(m|mm)
+CompileFlags:
+  Remove: [-x]
+  Add: [-xobjective-c++, -fobjc-arc, -fblocks]
+
+---
+# Apple clangd 21 has no Metal Shading Language frontend. Keep these files out
+# of background indexing and suppress C++ parser errors; this is not MSL support.
+# Shared ABI/parameter headers remain enabled as C++ for host-side navigation.
+If:
+  PathMatch:
+    - .*\.metal
+    - src/metal/probability/(numeric|quantization)\.h
+    - src/metal/dac/convolution\.h
+CompileFlags:
+  CompilationDatabase: None
+  # clangd can report the fatal error-limit diagnostic even with Suppress: '*'.
+  # Disable the limit for this C++ fallback so that diagnostic is never emitted.
+  Remove: [-ferror-limit=*]
+  Add: [-ferror-limit=0]
+Index:
+  Background: Skip
+Diagnostics:
+  Suppress: '*'

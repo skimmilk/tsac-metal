@@ -1,0 +1,23 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: None
+AllowShortLambdasOnASingleLine: None
+AllowShortEnumsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Allman
+InsertBraces: true
+PointerAlignment: Left
+ReferenceAlignment: Left
+SortIncludes: CaseSensitive
+SeparateDefinitionBlocks: Always
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"tsac/'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 3

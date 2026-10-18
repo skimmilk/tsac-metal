@@ -1,0 +1,15 @@
+/archive/
+/original/
+/models/
+/build*/
+__pycache__/
+*.f32
+.DS_Store
+*.opus
+*.wav
+*.tsac
+/tsac
+/*.weights
+/.tsac-*
+docs/
+benchmarks/

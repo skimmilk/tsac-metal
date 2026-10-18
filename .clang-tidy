@@ -1,0 +1,17 @@
+InheritParentConfig: false
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  misc-include-cleaner,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -performance-enum-size
+# Keep established numeric interfaces and public/Metal ABI enum layouts.
+# Signed bit operations are intentional in the codec's numeric kernels.
+HeaderFilterRegex: '(include|src|tests)/.*'
+CheckOptions:
+  misc-include-cleaner.MissingIncludes: false
+  # Factories consume adapters so source mappings can be released before return.
+  performance-unnecessary-value-param.AllowedTypes: '(^|::)(DacAnalysisModel|DacSynthesisModel|RvqEncoderModel|RvqDecoderModel|TransformerModel)$'
