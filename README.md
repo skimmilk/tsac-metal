@@ -24,9 +24,6 @@ project root. Set `TSAC_BUILD_DIR` or `TSAC_BUILD_CONFIG` to select another buil
 directory/configuration. See [WEIGHTS.md](WEIGHTS.md) for model downloads,
 weight storage, packaging options, mapping lifetimes, and asset cleanup.
 
-CPU benchmark tools, retained optimization decisions, and validation results are
-in [benchmarks/README.md](benchmarks/README.md).
-
 ```sh
 cmake --install build --prefix /your/prefix
 cmake --build build --target uninstall
