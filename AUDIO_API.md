@@ -89,6 +89,11 @@ can be reused after success, validation failure,
 inference failure, or an observer exception. Explicitly requesting an unavailable
 Apple ARM or Metal implementation fails at construction; no automatic execution fallback occurs.
 
+CPU DAC loading shares the recording's worker pool. Large convolutions prepare
+independent normalization columns in parallel within that budget; zero and one
+remain serial. Loading writes directly into final ordinary-convolution storage
+or the transposed convolution's phase matrices, with bounded temporary tiles.
+
 `AppleArmAnalyzer` retains at most one idle prepared session for sequential reuse.
 The cache matches the encoding/decoding role, mono/stereo model, exact codebook
 coverage, and fast/normal method. A different key evicts the idle session; an
@@ -97,6 +102,14 @@ convolutions never borrow call-local execution resources. Transformer KV storage
 is released after entropy decoding, before DAC synthesis, and after encoding.
 Prepared weights remain resident until eviction or analyzer destruction, so model
 files must remain immutable for that lifetime. Copies share the single idle slot.
+
+`MetalAnalyzer` uses the same single-idle-session key and eviction policy for
+prepared DAC, RVQ and probability weights. It releases Transformer KV caches,
+scratch and command storage after each probability operation, before synthesis
+on decode. Reusing the session avoids weight preparation, while each recording
+gets fresh execution state. Exceptions discard the leased session. Prepared
+weights remain resident until eviction or analyzer destruction; copies share
+the idle slot and model files must remain immutable for that lifetime.
 
 The optional `EntropyObserver` runs synchronously in stream entropy order after
 the associated work completes, provides per-symbol bit statistics, and propagates

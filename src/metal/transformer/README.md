@@ -5,18 +5,18 @@ interface accepts models and exposes normal-stream `encode` and resident
 `decode`. Each operation resets logical stream state while preserving reusable
 execution resources. `new_session()` shares the immutable model and creates an
 independent recording owner, queue, caches, and scratch storage.
+`clear_session()` releases mutable execution state while retaining prepared
+weights; the next encode/decode recreates that state. The analyzer uses it to
+avoid retaining probability scratch and KV buffers alongside DAC working memory.
 
 ## Implementation boundaries
 
 - `model.hpp` / `model.mm`: GPU-prepared projections, normalization parameters,
-  projected DAC embeddings, learned positions, and rotary coefficients. Model
-  bytes are borrowed during preparation; the resulting buffers own their data.
-  Small BF16 constants share an aligned allocation. Preparation writes constants,
-  embeddings, and packed weights directly into their final shared buffers. One
-  immutable residency set retains every model backing allocation.
-  Constants already stored as BF16 are checked for nonfinite values using their
-  original bits and copied without an intermediate FP32 allocation. Other source
-  encodings retain the conversion path.
+  feedback embeddings, learned positions, and rotary coefficients. Canonical
+  int8 weights, scales, biases and BF16 constants use no-copy mapping imports.
+  R2/R8 projection tiles are interleaved directly into final shared buffers;
+  only partial tiles need padding writes. One immutable residency set retains
+  every model backing allocation, including imported mapping owners.
 - `session.hpp` / `session.mm`: the recording owner, lane caches, logical cache
   positions, uniform cache views, and the budget-aware unequal-lane layout.
   Matching stream geometries reuse caches. Cache residency changes only when

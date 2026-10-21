@@ -3,7 +3,9 @@
 
 namespace tsac::model_contract
 {
-inline constexpr std::size_t tensor_alignment = 256, mapping_alignment = 16384;
+inline constexpr std::size_t tensor_alignment = 256;
+// Apple Silicon's 16 KiB page size also defines the on-disk region alignment.
+inline constexpr std::size_t mapping_alignment = 16384;
 inline constexpr unsigned stages = 4, residual_units = 3, dac_convolutions = 30;
 inline constexpr unsigned temporal_layers = 12, codebook_layers = 3;
 inline constexpr unsigned transformer_width = 512, latent_width = 1024;

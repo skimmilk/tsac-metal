@@ -118,9 +118,7 @@ DacSynthesis<Kernels> DacSynthesis<Kernels>::from_model(DacSynthesisModel model,
     const auto conv = [&](const ConvolutionWeights& weights, std::size_t stride = 1,
                           std::size_t dilation = 1, bool transposed = false)
     {
-        auto result = Kernels::Conv1d::from_weights(weights, limits, stride, dilation, transposed);
-        kernels.bind(result);
-        return result;
+        return kernels.convolution(weights, limits, stride, dilation, transposed);
     };
     auto entry = conv(model.entry_convolution());
     std::vector<synthesis_detail::DecoderBlock<Kernels>> blocks;

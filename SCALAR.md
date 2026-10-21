@@ -9,7 +9,9 @@ numerical behavior, rather than production audio processing.
 
 ## Build
 
-Use CMake 3.20 or later and a C++23 compiler **and standard library**. The scalar library should compile on any machine with that support. Prepared model assets currently use
+Use CMake 3.20 or later and a C++23 compiler **and standard library**. The scalar
+kernels are portable; model loading requires POSIX `mmap` and `madvise`, with
+fixed 16 KiB Apple Silicon page alignment. Prepared model assets currently use
 little-endian IEEE-754 representations.
 
 ```sh

@@ -2,18 +2,14 @@
 
 A native C++23 implementation of Fabrice Bellard's TSAC codec for Apple M1 or
 later. CPU inference requires **macOS 15 or later**; the Metal 4 backend requires
-**macOS 26 or later**. Both support DAC encoding and
-decoding and deterministic normal-mode probability inference.
+**macOS 26 or later**.
 
 A [reference scalar option](SCALAR.md) is also available for research. It uses
-plain C++ and should compile on any machine with a C++23 compiler and standard
+plain C++ and should compile on any UNIX machine with a C++23 compiler and standard
 library, without Apple frameworks or NEON extensions.
 
-Build the CPU Accelerate/NEON path with CMake 3.20 or later and Xcode 15.3 or later
-(Metal 4 builds need a newer SDK as described below):
-
 ```sh
-./build.sh -DTSAC_ENABLE_METAL=OFF
+./build.sh
 ctest --test-dir build --output-on-failure
 ./tsac -T 1 -q 3 c input.wav encoded.tsac
 ./tsac d encoded.tsac decoded.wav

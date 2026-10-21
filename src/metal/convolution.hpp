@@ -1,5 +1,6 @@
 #pragma once
 #include "common/signal.hpp"
+#include "models/types.hpp"
 #include "weights/tensor_weights.hpp"
 
 #include <memory>
@@ -18,6 +19,8 @@ public:
                                     std::span<const float> bias);
     static MetalConvolution from_prepared(Conv1dConfig config, const weights::View& weights,
                                           const weights::View& bias);
+    static MetalConvolution from_weights(Conv1dConfig config, const ConvolutionWeights& weights,
+                                         const Limits& limits);
     Signal apply(std::span<const float> input, SignalShape shape, const Limits& limits = {}) const;
 
 private:

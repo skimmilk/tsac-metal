@@ -145,9 +145,8 @@ void thread_budgets(const ModelDirectory& directory)
 #endif
 }
 
-void session_reuse(const ModelDirectory& directory)
+void session_reuse(AudioAnalyzer& analyzer)
 {
-    AppleArmAnalyzer analyzer(directory, {}, 2);
     const std::vector<float> pcm(1025, 0.125f);
     const auto input = interleaved_pcm(pcm, 1);
     EncodeOptions options;
@@ -448,8 +447,8 @@ int main(int argc, char** argv)
         if (!metal)
         {
             thread_budgets(directory);
-            session_reuse(directory);
         }
+        session_reuse(*analyzer);
         layouts(*analyzer);
         groups_and_empty(*analyzer);
         failures(*analyzer, directory, metal);

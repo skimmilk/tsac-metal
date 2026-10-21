@@ -156,7 +156,11 @@ when an observer is attached; ordinary inference creates no such labels.
 Constructing a `ModelDirectory` maps nothing. Constructing a concrete adapter maps
 only its role's required regions after range, alignment, and policy-limit checks.
 File descriptors are closed after mapping. File sizes only need to cover those
-ranges; no expected-size metadata is required. Mappings are private and read-only.
+ranges; no expected-size metadata is required. Runtime model loading uses only
+private, read-only `mmap`, with `madvise(..., MADV_WILLNEED)` issued for each new
+region. The hint is advisory; failure does not prevent using the mapping.
+Mapping checks and Metal imports use the same fixed 16 KiB Apple Silicon page
+alignment as the packed files.
 Tensor views and Metal imports share RAII owners; the final owner unmaps the
 region. The directory's weak cache cannot extend a mapping's lifetime.
 
@@ -165,12 +169,18 @@ temporary, so the factory's adapter is destroyed when preparation returns. An
 external caller that keeps an adapter copy or tensor view deliberately keeps its
 mapping alive. No global release or forced-unmap method can invalidate it.
 
-DAC preparation expands one convolution, folds its captured normalization,
-and creates the selected backend's execution array. Ordinary CPU convolutions
-move the folded vector into final storage. Expanded temporaries are destroyed
-before final phase packing/upload. When the consumed analysis or synthesis
-adapter is destroyed after preparation, its quantized source mapping is released.
-Mapped biases/alpha views retain only the small shared region.
+CPU DAC preparation expands and folds 32 source columns at a time. Ordinary
+Apple ARM convolutions and scalar convolutions write directly into their final
+weight vector. Apple ARM transposed convolutions fold a bounded input-channel
+tile and copy it directly into the final phase-specific BLAS matrices. Neither
+path retains a full expanded or folded temporary. Preparation uses the supplied
+recording worker pool and respects its thread budget; zero/one-thread policies
+remain serial and small weights do not submit worker jobs. Metal writes bounded
+tiles into its packed shared buffer with at most four concurrent ranges. All
+paths retain the captured reduction tree and FP32 multiplication boundaries.
+When the consumed analysis or synthesis adapter is destroyed after preparation,
+its quantized source mapping is released. Mapped biases/alpha views retain only
+the small shared region.
 
 CPU Transformer construction builds R4 tiles from the canonical row-major
 mapping and then releases the source mapping. Scales, biases and BF16 constants
@@ -181,13 +191,64 @@ Metal construction imports canonical row-major regions without copying and
 builds R2/R8 tiles in owned GPU buffers. Imports of the same mapping share a
 buffer wrapper; residency follows those allocations. The Metal deallocator
 retains the mapping independently, so destroying adapters does not unmap
-live GPU weights. Immutable imports reject mutable CPU access. Metal 4 execution
-and these import/protection details require subsequent GPU validation.
+live GPU weights. R2/R8 packing uses integer SIMD interleaving and clears only
+padding in partial tiles. Immutable imports reject mutable CPU access.
 
-Encoding finishes and releases analysis/RVQ state before entropy-model loading.
-Decoding destroys entropy-model state before preparing RVQ reconstruction and
-synthesis. Fast mode never opens Transformer weights. RVQ data map only enabled
-books; encode-only search/input projections are not requested during decoding.
+Scalar encoding releases analysis/RVQ state before entropy-model loading, and
+scalar decoding releases the entropy model before synthesis preparation.
+Apple ARM and Metal analyzers retain one idle prepared model bundle, as described
+in [AUDIO_API.md](AUDIO_API.md). Metal releases mutable probability execution state
+before synthesis while retaining immutable weights for reuse. Fast mode never
+opens Transformer weights. RVQ data map only enabled books; encode-only
+search/input projections are not requested during decoding.
+
+## CPU DAC preparation measurements
+
+On 21 October 2026, Release builds on an eight-core Apple M1 with 16 GiB RAM and
+macOS 27.0.1 were compared using stereo model construction and destruction. Each
+variant ran in two fresh processes in ABBA order, six calls per process; the
+first call was excluded from each process's warm median. The recording worker
+pool was reused across calls, as in the analyzer. No OS caches were cleared.
+
+- With eight workers, analysis preparation changed from 30.81 to 9.33 ms and
+  synthesis from 87.37 to 25.72 ms, about 70% less time in both cases. Maximum
+  process RSS fell from 168.6 to 115.4 MiB for analysis and from 421.6 to
+  286.6 MiB for synthesis.
+- With four workers, analysis changed from 31.05 to 10.66 ms and synthesis from
+  85.14 to 26.65 ms. The existing worker budget controls preparation as well as
+  inference; no separate pool or automatic extra threads were added.
+- With the serial API budget of zero, analysis changed from 31.47 to 28.10 ms
+  and synthesis from 83.42 to 72.48 ms. Peak RSS fell to 114.7/269.6 MiB.
+  Single-thread analysis timings were approximately unchanged; its memory
+  reduction still justifies the direct-storage refactor.
+- The portable scalar path stays serial. Analysis preparation was approximately
+  unchanged at 28.8/29.0 ms; synthesis changed from 77.18 to 70.53 ms. Peak RSS
+  fell from 168.6/421.6 to 114.6/269.5 MiB.
+
+These are loading measurements, including destruction, rather than inference
+measurements. RSS includes mappings, final weights and worker/runtime storage.
+CPU prepared-session caching was already implemented and remains unchanged.
+The source-layout path checks every mono/stereo convolution against full-tensor
+folding; transposed phase packing also checks exact convolution outputs against
+the previous preparation path, including ragged columns and missing phases.
+All 17 Release tests, six scalar-only tests and four targeted ASan/UBSan tests
+passed. Three paired fresh-process comparisons on the 30-second music fixture
+(`-T 8 -q 3 --batch_size 3`) produced identical streams and common-input WAVE
+decodes. Encode medians were 6.659/6.692 seconds and decode medians were
+11.192/10.990 seconds. Whole-recording changes are small relative to inference
+and run variation; the established gains are loading time and temporary memory.
+
+The benchmark runs without Metal and accepts analysis/synthesis roles, or
+scalar-analysis/scalar-synthesis for the reference implementation:
+
+```sh
+cmake -S . -B build-cpu-release -DCMAKE_BUILD_TYPE=Release -DTSAC_ENABLE_METAL=OFF
+cmake --build build-cpu-release --target tsac-cpu-preparation -j 4
+"$PWD/build-cpu-release/tsac-cpu-preparation" "$PWD/build-cpu-release" analysis 6 8
+"$PWD/build-cpu-release/tsac-cpu-preparation" "$PWD/build-cpu-release" synthesis 6 8
+```
+
+Without role/trial/thread arguments, the executable performs correctness checks.
 
 ## Staging, cleanup and installation
 

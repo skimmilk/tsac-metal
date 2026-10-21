@@ -17,4 +17,9 @@ std::vector<float> fold_weight_norm(std::span<const float> v, std::span<const fl
 // Squares reduce through a balanced adjacent-pair tree, padded with zeros.
 std::vector<float> fold_dac_weight_norm(std::span<const float> v, std::span<const float> g,
                                         std::size_t fan_in, const Limits& limits = {});
+// The output may alias v exactly. This permits bounded expansion/folding without
+// changing the reduction tree or any FP32 normalization boundary.
+void fold_dac_weight_norm_into(std::span<const float> v, std::span<const float> g,
+                               std::size_t fan_in, std::span<float> output,
+                               const Limits& limits = {});
 } // namespace tsac

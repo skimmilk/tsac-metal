@@ -32,6 +32,14 @@ drain the queue before releasing resources.
 This follows Apple's [Metal 4 resource and command model](https://developer.apple.com/videos/play/wwdc2025/205/).
 The runtime explicitly requires a GPU with unified memory.
 
+`MetalAnalyzer` retains one idle prepared model bundle for matching repeated
+recordings. The key includes encode/decode, mono/stereo, enabled codebooks and
+fast/normal mode. A changed key evicts the idle bundle; failures discard the
+leased bundle. Transformer KV caches, activations and recorded command storage
+are released after each probability operation, before synthesis on decode.
+Only prepared model resources survive in the cache. Copies share the idle slot;
+model files must remain immutable until eviction or analyzer destruction.
+
 `MetalAnalyzer` records analysis and RVQ encoding in one DAC graph per bounded
 chunk. The central latent interval is a buffer slice, including when analysis
 has context frames on either side. Decoding records RVQ accumulation and DAC
@@ -115,6 +123,80 @@ not the intended numerical contract.
 
 The active Xcode SDK supplies `metal` and `metallib` through `xcrun`. For a separate
 toolchain, set the CMake cache paths `TSAC_METAL_COMPILER` and `TSAC_METAL_LINKER`.
+
+## Weight preparation
+
+DAC preparation expands and normalizes 32 source columns at a time, then writes
+them directly into the final packed shared buffer. Ordinary convolutions
+transpose the bounded tile; transposed convolutions retain their source
+normalization axes and reorder taps separately. The adjacent-pair reduction tree
+and all three normalization multiplications retain their FP32 boundaries. The
+shared expansion/folding helpers accept caller-owned storage, including exact
+input/output aliasing for folding. Biases and activation parameters stay mapped.
+
+Probability projections share one integer SIMD packing routine for both owned
+and mapped source weights. R2/R8 tiles are fully overwritten; only a partial
+final tile needs zero padding. Canonical row-major weights remain mapped for
+the kernels that use that layout. Both preparation paths split large tensors
+into at most four contiguous CPU ranges through GCD. Small tensors stay serial;
+worker exceptions are rethrown only after every range has completed.
+
+Measurements on 21 October 2026 used an Apple M1 with eight physical CPU cores,
+16 GiB RAM, macOS 27.0.1, and a Release build. Factory benchmarks construct and
+destroy a stereo model each time. Each variant ran in two fresh processes in
+ABBA order with six calls per process; the first call in each process was
+excluded from the warm median. No OS caches were cleared. All comparisons used
+identical weight payloads and unchanged shaders.
+
+- DAC analysis preparation: 62.72 to 24.24 ms, 61% less time. Maximum process RSS
+  across the sampled calls fell from 229.8 to 128.2 MiB.
+- DAC synthesis preparation: 138.28 to 45.46 ms, 67% less time. Maximum process RSS
+  fell from 585.5 to 283.7 MiB.
+- Probability preparation: 13.74 to 7.55 ms, 45% less time. Process RSS was
+  essentially unchanged at about 105.5 MiB.
+
+These are model preparation measurements, including teardown; process RSS
+includes mappings, prepared weights and Metal runtime allocations. Runtime
+`host prepare` counters measure submission preparation and do not isolate model
+weight expansion. The serial bounded-tile prototype did not establish an
+analysis preparation speedup, but substantially reduced memory. It was retained
+as the basis for parallel preparation. SIMD packing and four-range preparation
+each improved on their serial predecessors.
+
+The retained model cache was also compared with the same optimized implementation
+with idle retention disabled, in ABBA order with two processes per variant.
+For repeated 0.1-second stereo recordings, quality 3 and entropy batch 3, warm
+medians over ten samples changed from 106.84 to 65.07 ms for encode (39% less)
+and 143.55 to 72.45 ms for decode (50% less). Every repeated stream and PCM result
+matched. The cache retains prepared weights while idle, so it trades resident
+memory for avoiding repeated preparation. It does not retain Transformer scratch
+or KV caches, and a different model/role key evicts the idle bundle.
+
+Three paired fresh-process comparisons on the 30-second music fixture, with
+quality 3 and entropy batch 3, produced identical encoded streams and common-input
+WAVE decodes. Encode medians were 9.683/9.650 seconds and decode medians were
+12.287/12.220 seconds. These differences are within the observed variation and
+do not establish an overall inference speedup; the retained gains are in
+preparation, temporary memory and repeated short recordings.
+
+The test executable provides a reproducible factory benchmark and a retained
+analyzer benchmark. Use a Release build and keep first calls separate:
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target tsac-metal-preparation -j 4
+"$PWD/build-release/tsac-metal-preparation" "$PWD/build-release" analysis 6
+"$PWD/build-release/tsac-metal-preparation" "$PWD/build-release" synthesis 6
+"$PWD/build-release/tsac-metal-preparation" "$PWD/build-release" probability 6
+"$PWD/build-release/tsac-metal-preparation" "$PWD/build-release" repeated 6
+```
+
+Without the role/trial arguments it checks every mono/stereo DAC weight against
+the full-tensor preparation path, every probability projection against its
+canonical bytes, partial tiles, bounded allocations and parallel failures.
+Release validation passed all 16 tests; the scalar-only build passed all five
+tests. ASan/UBSan passed preparation and CPU/Metal analyzer contracts, including
+repeated, concurrent, role-changing and failed operations.
 
 ## Probability and entropy
 

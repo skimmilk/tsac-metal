@@ -33,7 +33,6 @@ Conv1d::Conv1d(Conv1dConfig config, std::span<const float> weights, std::span<co
 {
     if (config.kind == ConvolutionKind::transposed)
     {
-        weights_.clear();
         prepare_transposed(weights);
     }
 }
@@ -52,7 +51,7 @@ Conv1d Conv1d::from_prepared(Conv1dConfig config, const weights::View& weights,
     return result;
 }
 
-void Conv1d::prepare_transposed(std::span<const float> weights)
+void Conv1d::prepare_phases()
 {
     const auto& config = config_;
     // Each phase contains only contributing taps; avoid multiplying the
@@ -74,20 +73,71 @@ void Conv1d::prepare_transposed(std::span<const float> weights)
             phase->taps.push_back(tap);
         }
     }
-    weights_.reserve(weights.size());
+    std::size_t offset = 0;
     for (auto& phase : phases_)
     {
-        phase.weight_offset = weights_.size();
+        phase.weight_offset = offset;
+        offset += phase.taps.size() * config.input_channels * config.output_channels;
+    }
+}
+
+void Conv1d::prepare_transposed(std::span<const float> weights)
+{
+    prepare_phases();
+    const auto& config = config_;
+    for (const auto& phase : phases_)
+    {
+        auto* output = weights_.data() + phase.weight_offset;
         for (auto tap : phase.taps)
         {
             for (std::size_t c = 0; c < config.input_channels; ++c)
             {
                 const auto offset = (c * config.kernel + tap) * config.output_channels;
-                weights_.insert(weights_.end(), weights.data() + offset,
-                                weights.data() + offset + config.output_channels);
+                std::copy_n(weights.data() + offset, config.output_channels, output);
+                output += config.output_channels;
             }
         }
     }
+}
+
+void Conv1d::prepare_dac_weights(const ConvolutionWeights& c, const Limits& limits,
+                                 const ParallelExecutor* execution)
+{
+    if (config_.kind == ConvolutionKind::ordinary)
+    {
+        Convolution::prepare_dac_weights(c, limits, execution);
+        return;
+    }
+    prepare_phases();
+    const auto& config = config_;
+    const auto fan_in = config.output_channels * config.kernel;
+    weights_.resize(c.values.shape().elements());
+    const auto gain = c.gain.values();
+    detail::prepare_weight_tiles(
+        config.input_channels, weights_.size(), execution,
+        [&](std::size_t first, std::size_t width)
+        {
+            // Normalize over [output,kernel] before copying this bounded input
+            // channel tile straight into the final phase-major BLAS matrices.
+            std::vector<float> values(fan_in * width);
+            weights::expand_into(c.values, first * fan_in, values);
+            fold_dac_weight_norm_into(values, gain.subspan(first, width), fan_in, values, limits);
+            for (const auto& phase : phases_)
+            {
+                for (std::size_t j = 0; j < phase.taps.size(); ++j)
+                {
+                    for (std::size_t in = 0; in < width; ++in)
+                    {
+                        const auto source = in * fan_in + phase.taps[j] * config.output_channels;
+                        const auto dest =
+                            phase.weight_offset +
+                            (j * config.input_channels + first + in) * config.output_channels;
+                        std::copy_n(values.data() + source, config.output_channels,
+                                    weights_.data() + dest);
+                    }
+                }
+            }
+        });
 }
 
 std::size_t Conv1d::tile_size(std::size_t frames, const Limits& limits) const

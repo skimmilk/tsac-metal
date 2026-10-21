@@ -57,7 +57,6 @@ public:
 private:
     friend struct detail::ModelDirectoryAccess;
     MappedRegion() = default;
-    std::shared_ptr<const void> storage_; // Owns a portable allocation when mmap is unavailable.
     const std::uint8_t* data_ = nullptr;
     std::size_t size_ = 0, offset_ = 0;
     ModelFile file_{};

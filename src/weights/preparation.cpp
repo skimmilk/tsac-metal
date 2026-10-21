@@ -9,18 +9,30 @@ namespace tsac::weights
 {
 std::vector<float> expand(const EncodedTensorView& tensor)
 {
-    const auto payload = tensor.payload();
     std::vector<float> values(tensor.shape().elements());
+    expand_into(tensor, 0, values);
+    return values;
+}
+
+void expand_into(const EncodedTensorView& tensor, std::size_t first, std::span<float> values)
+{
+    const auto payload = tensor.payload();
+    const auto count = tensor.shape().elements();
+    detail::require(first <= count && values.size() <= count - first,
+                    "source weight range exceeds tensor");
     if (tensor.encoding() == TensorEncoding::float32)
     {
-        detail::require(payload.size() == values.size() * 4, "invalid FP32 source weights");
-        std::memcpy(values.data(), payload.data(), payload.size());
+        detail::require(payload.size() == count * 4, "invalid FP32 source weights");
+        if (!values.empty())
+        {
+            std::memcpy(values.data(), payload.data() + first * 4, values.size_bytes());
+        }
     }
     else if (tensor.encoding() == TensorEncoding::bf16)
     {
         for (std::size_t i = 0; i < values.size(); ++i)
         {
-            values[i] = detail::bf16(payload, i * 2);
+            values[i] = detail::bf16(payload, (first + i) * 2);
         }
     }
     else
@@ -29,29 +41,29 @@ std::vector<float> expand(const EncodedTensorView& tensor)
         const auto rows = tensor.shape().axes[0], columns = tensor.shape().axes[1];
         const std::size_t block = 32;
         const auto padded = (columns + 7) / 8 * 8;
+        const auto plane = tensor.data_plane_bytes();
         detail::require(rows && columns && rows % block == 0, "invalid quantized source shape");
-        for (std::size_t outer = 0; outer < values.size() / rows / columns; ++outer)
+        detail::require(first % rows == 0 && values.size() % rows == 0,
+                        "unaligned quantized source range");
+        for (std::size_t c = 0; c < values.size() / rows; ++c)
         {
-            for (std::size_t column = 0; column < columns; ++column)
+            const auto column = first / rows + c;
+            for (std::size_t b = 0; b < rows / block; ++b)
             {
-                for (std::size_t b = 0; b < rows / block; ++b)
+                const auto scale = detail::bf16(
+                    payload,
+                    plane +
+                        ((column / columns * (rows / block) + b) * padded + column % columns) * 2);
+                const auto begin = column * rows + b * block;
+                for (std::size_t i = 0; i < block; ++i)
                 {
-                    const auto scale = detail::bf16(
-                        payload, tensor.data_plane_bytes() +
-                                     ((outer * (rows / block) + b) * padded + column) * 2);
-                    const auto begin = (outer * columns + column) * rows + b * block;
-                    for (std::size_t i = 0; i < block; ++i)
-                    {
-                        values[begin + i] =
-                            static_cast<float>(static_cast<std::int8_t>(payload[begin + i])) *
-                            scale;
-                    }
+                    values[c * rows + b * block + i] =
+                        static_cast<float>(static_cast<std::int8_t>(payload[begin + i])) * scale;
                 }
             }
         }
     }
     detail::require_finite(values, "nonfinite source weights");
-    return values;
 }
 
 void normalize_search(std::span<const float, 8> input, std::span<float, 8> output)

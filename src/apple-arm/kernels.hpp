@@ -26,6 +26,15 @@ struct Kernels
         convolution.set_execution(execution);
     }
 
+    Conv1d convolution(const ConvolutionWeights& weights, const Limits& limits, std::size_t stride,
+                       std::size_t dilation, bool transposed) const
+    {
+        auto result =
+            Conv1d::from_weights(weights, limits, stride, dilation, transposed, execution);
+        bind(result);
+        return result;
+    }
+
     static void add(std::span<std::uint16_t> left, std::span<const std::uint16_t> right)
     {
         add_bf16(left, right);

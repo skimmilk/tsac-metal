@@ -2,8 +2,6 @@
 
 #include "common/internal.hpp"
 #include "models/contract.hpp"
-#include "weights/normalization.hpp"
-#include "weights/preparation.hpp"
 
 #include <array>
 #include <optional>
@@ -23,11 +21,7 @@ void AudioDac::convolution(const ConvolutionWeights& weights, const Limits& limi
                               stride == 1 ? (kernel - 1) * dilation / 2 : (stride + 1) / 2,
                               dilation,
                               transposed ? ConvolutionKind::transposed : ConvolutionKind::ordinary};
-    detail::require(weights.values.shape().elements() <= limits.tensor_elements,
-                    "Metal convolution exceeds element limit");
-    auto folded = fold_dac_weight_norm(weights::expand(weights.values), weights.gain.values(),
-                                       first * kernel, limits);
-    operations_.emplace_back(MetalConvolution::prepare(config, folded, weights.bias.values()));
+    operations_.emplace_back(MetalConvolution::from_weights(config, weights, limits));
 }
 
 void AudioDac::activation(const TensorView<float>& alpha)

@@ -5,10 +5,91 @@
 #include "common/audio_pipeline.hpp"
 #include "metal/transformer.hpp"
 
+#include <exception>
+#include <mutex>
+#include <optional>
+
 namespace tsac
 {
+struct MetalAnalyzer::Cache
+{
+    struct Session
+    {
+        ModelVariant variant;
+        unsigned books;
+        bool encoding, normal;
+        std::optional<metal::AudioDac> dac;
+        std::optional<metal::AudioRvqEncoder> encoder;
+        std::optional<metal::AudioRvqDecoder> decoder;
+        std::optional<MetalTransformer> transformer;
+
+        Session(const Header& h, bool encode)
+            : variant(detail::audio_variant(h)), books(h.codebooks), encoding(encode),
+              normal(h.method == 1)
+        {
+        }
+
+        bool matches(const Header& h, bool encode) const
+        {
+            return variant == detail::audio_variant(h) && books == h.codebooks &&
+                   encoding == encode && normal == (h.method == 1);
+        }
+
+        void release_transformer_state()
+        {
+            if (transformer)
+            {
+                // Keep immutable prepared weights, releasing KV caches, scratch,
+                // recorded commands and stream state before the next phase.
+                transformer->clear_session();
+            }
+        }
+    };
+
+    struct Lease
+    {
+        Cache& cache;
+        std::unique_ptr<Session> session;
+        int exceptions = std::uncaught_exceptions();
+
+        ~Lease()
+        {
+            if (std::uncaught_exceptions() != exceptions)
+            {
+                return;
+            }
+            std::lock_guard lock(cache.mutex);
+            if (!cache.idle)
+            {
+                cache.idle = std::move(session);
+            }
+        }
+    };
+
+    Lease take(const Header& header, bool encoding)
+    {
+        std::unique_ptr<Session> session;
+        {
+            std::lock_guard lock(mutex);
+            session = std::move(idle);
+        }
+        if (session && !session->matches(header, encoding))
+        {
+            session.reset();
+        }
+        if (!session)
+        {
+            session = std::make_unique<Session>(header, encoding);
+        }
+        return {*this, std::move(session)};
+    }
+
+    std::mutex mutex;
+    std::unique_ptr<Session> idle;
+};
+
 MetalAnalyzer::MetalAnalyzer(ModelDirectory directory, const Limits& limits)
-    : directory_(std::move(directory)), limits_(limits)
+    : cache_(std::make_shared<Cache>()), directory_(std::move(directory)), limits_(limits)
 {
     detail::require(metal::available(),
                     "Metal 4 requires macOS 26 or later and a supported Apple GPU");
@@ -18,15 +99,21 @@ Bytes MetalAnalyzer::encode(PcmView audio, const EncodeOptions& options,
                             const EntropyObserver& observer)
 {
     const auto header = detail::audio_header(audio, options, limits_);
+    auto lease = cache_->take(header, true);
+    auto& session = *lease.session;
     std::vector<std::uint16_t> tokens;
     {
         const auto pcm = detail::padded_audio(audio, header, limits_);
         const auto variant = detail::audio_variant(header);
-        const auto analysis =
-            metal::AudioDac::from_model(DacAnalysisModel(directory_, variant), limits_);
-        const auto quantizer = metal::AudioRvqEncoder::from_model(
-            RvqEncoderModel(directory_, variant, RvqInputLayout::output_major, header.codebooks),
-            limits_);
+        if (!session.dac)
+        {
+            session.dac =
+                metal::AudioDac::from_model(DacAnalysisModel(directory_, variant), limits_);
+            session.encoder = metal::AudioRvqEncoder::from_model(
+                RvqEncoderModel(directory_, variant, RvqInputLayout::output_major,
+                                header.codebooks),
+                limits_);
+        }
         tokens.resize(header.symbol_count());
         const auto chunk_size = detail::audio_chunk_frames(200, limits_);
         metal::DacGraph graph;
@@ -40,14 +127,15 @@ Bytes MetalAnalyzer::encode(PcmView audio, const EncodeOptions& options,
                 graph.begin();
                 const auto input = graph.upload(
                     std::span(pcm.values).subspan(offset, shape.elements(limits_)), shape, limits_);
-                const auto latent = analysis.record(graph, input, limits_);
+                const auto latent = session.dac->record(graph, input, limits_);
                 auto central_header = chunk.header(header);
                 central_header.frames = chunk.count;
                 const metal::DacTensor central{
                     {1024, chunk.count, 1},
                     latent.buffer.slice((begin - chunk.left) * 1024 * sizeof(float),
                                         chunk.count * 1024 * sizeof(float))};
-                const auto selected = quantizer.record(graph, central_header, central, limits_);
+                const auto selected =
+                    session.encoder->record(graph, central_header, central, limits_);
                 graph.finish();
                 for (std::size_t book = 0; book < selected.size(); ++book)
                 {
@@ -66,15 +154,22 @@ Bytes MetalAnalyzer::encode(PcmView audio, const EncodeOptions& options,
     {
         return pack_fast(header, tokens, limits_);
     }
-    auto transformer = MetalTransformer::from_model(
-        TransformerModel(directory_, detail::audio_variant(header), header.codebooks), limits_);
-    return transformer.encode(header, tokens, detail::completed_symbols(observer));
+    if (!session.transformer)
+    {
+        session.transformer = MetalTransformer::from_model(
+            TransformerModel(directory_, detail::audio_variant(header), header.codebooks), limits_);
+    }
+    auto result = session.transformer->encode(header, tokens, detail::completed_symbols(observer));
+    session.release_transformer_state();
+    return result;
 }
 
 PcmAudio MetalAnalyzer::decode(ByteView stream, const EntropyObserver& observer)
 {
     const auto header = parse_header(stream, limits_);
     detail::require_probability_assets(header);
+    auto lease = cache_->take(header, false);
+    auto& session = *lease.session;
     std::vector<std::uint16_t> tokens;
     if (header.method == 0)
     {
@@ -82,15 +177,22 @@ PcmAudio MetalAnalyzer::decode(ByteView stream, const EntropyObserver& observer)
     }
     else
     {
-        auto transformer = MetalTransformer::from_model(
-            TransformerModel(directory_, detail::audio_variant(header), header.codebooks), limits_);
-        tokens = transformer.decode(stream, detail::completed_symbols(observer));
+        if (!session.transformer)
+        {
+            session.transformer = MetalTransformer::from_model(
+                TransformerModel(directory_, detail::audio_variant(header), header.codebooks),
+                limits_);
+        }
+        tokens = session.transformer->decode(stream, detail::completed_symbols(observer));
+        session.release_transformer_state();
     }
     const auto variant = detail::audio_variant(header);
-    const auto quantizer = metal::AudioRvqDecoder::from_model(
-        RvqDecoderModel(directory_, variant, header.codebooks), limits_);
-    const auto synthesis =
-        metal::AudioDac::from_model(DacSynthesisModel(directory_, variant), limits_);
+    if (!session.dac)
+    {
+        session.decoder = metal::AudioRvqDecoder::from_model(
+            RvqDecoderModel(directory_, variant, header.codebooks), limits_);
+        session.dac = metal::AudioDac::from_model(DacSynthesisModel(directory_, variant), limits_);
+    }
     auto audio = detail::allocate_pcm(header, limits_);
     const auto chunk_size = detail::audio_chunk_frames(400, limits_);
     metal::DacGraph graph;
@@ -101,8 +203,9 @@ PcmAudio MetalAnalyzer::decode(ByteView stream, const EntropyObserver& observer)
             const auto chunk = detail::audio_chunk(begin, header.frames, chunk_size, 11, 11);
             const auto selected = detail::chunk_tokens(tokens, header, group, chunk);
             graph.begin();
-            const auto latent = quantizer.record(graph, chunk.header(header), selected, limits_);
-            const auto evaluated = synthesis.record(graph, latent, limits_);
+            const auto latent =
+                session.decoder->record(graph, chunk.header(header), selected, limits_);
+            const auto evaluated = session.dac->record(graph, latent, limits_);
             graph.finish();
             const auto values = evaluated.buffer.mapped<float>();
             for (std::size_t sample = 0; sample < chunk.count * 512; ++sample)

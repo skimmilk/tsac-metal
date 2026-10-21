@@ -22,6 +22,9 @@ public:
 
     // Independent mutable state sharing the same immutable GPU model/residency.
     MetalTransformer new_session() const;
+    // Release stream state, KV caches, scratch and command storage while keeping
+    // immutable prepared weights. Execution state is recreated on the next call.
+    void clear_session();
 
     // Normal framing, with causal known-token lookahead and host range encoding.
     Bytes encode(Header header, std::span<const std::uint16_t> tokens,

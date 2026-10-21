@@ -6,6 +6,7 @@
 #include "metal/convolution.hpp"
 #include "metal/dac/parameters.h"
 #include "metal/runtime.hpp"
+#include "metal/weight_preparation.hpp"
 #include "weights/normalization.hpp"
 
 #include <array>
@@ -67,6 +68,36 @@ MetalConvolution MetalConvolution::from_prepared(Conv1dConfig config, const weig
     (void)program();
     return MetalConvolution(std::make_shared<Impl>(config, metal::Buffer::import_weights(weights),
                                                    metal::Buffer::import_weights(bias)));
+}
+
+MetalConvolution MetalConvolution::from_weights(Conv1dConfig config,
+                                                const ConvolutionWeights& weights,
+                                                const Limits& limits)
+{
+    detail::require(config.kind == ConvolutionKind::ordinary ||
+                        config.kind == ConvolutionKind::transposed,
+                    "invalid Metal convolution kind");
+    const auto transposed = config.kind == ConvolutionKind::transposed;
+    const auto axes = weights.values.shape().axes;
+    detail::require(axes[0] == (transposed ? config.output_channels : config.input_channels) &&
+                        axes[1] == config.kernel &&
+                        axes[2] == (transposed ? config.input_channels : config.output_channels) &&
+                        weights.bias.size() == config.output_channels && config.stride &&
+                        config.dilation,
+                    "Metal convolution source shape mismatch");
+    const auto count = weights.values.shape().elements();
+    detail::require(count <= limits.tensor_elements, "Metal convolution exceeds element limit");
+    dimension(count);
+    dimension(checked_add(checked_mul(config.kernel - 1, config.dilation), 1));
+    dimension(checked_mul(config.padding, 2));
+    detail::require_finite(weights.bias.values(), "nonfinite Metal convolution bias");
+    auto packed = metal::Buffer::allocate(checked_mul(count, sizeof(float)));
+    metal::prepare_dac_weights(weights, transposed,
+                               {reinterpret_cast<float*>(packed.mapped_bytes().data()), count},
+                               limits);
+    (void)program();
+    return MetalConvolution(std::make_shared<Impl>(
+        config, std::move(packed), metal::Buffer::import_weights(weights::View(weights.bias))));
 }
 
 MetalConvolution MetalConvolution::prepare(Conv1dConfig config, std::span<const float> weights,

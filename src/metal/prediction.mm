@@ -5,6 +5,7 @@
 #include "metal/linear.hpp"
 #include "metal/probability/parameters.h"
 #include "metal/runtime.hpp"
+#include "metal/weight_preparation.hpp"
 #include "probability_metallib.hpp"
 
 #include <array>
@@ -84,18 +85,7 @@ MetalLinear MetalLinear::prepare(std::size_t input, std::size_t output,
     const auto padded = checked_mul((checked_add(output, rows - 1) / rows), rows);
     auto packed = metal::Buffer::allocate(checked_mul(input, padded));
     auto* packed_bytes = reinterpret_cast<std::int8_t*>(packed.mapped_bytes().data());
-    std::fill_n(packed_bytes, packed.size(), std::int8_t{0});
-    for (std::size_t tile = 0; tile < padded / rows; ++tile)
-    {
-        for (std::size_t quartet = 0; quartet < input / 4; ++quartet)
-        {
-            for (std::size_t row = 0; row < rows && tile * rows + row < output; ++row)
-            {
-                std::copy_n(weights.data() + (tile * rows + row) * input + quartet * 4, 4,
-                            packed_bytes + (tile * input + quartet * 4) * rows + row * 4);
-            }
-        }
-    }
+    metal::pack_linear_weights(weights, input, output, rows, {packed_bytes, packed.size()});
     auto impl = std::make_shared<Impl>(Impl{input, output, upload(weights), upload(scales),
                                             upload(bias), std::move(packed), rows});
     return MetalLinear(std::move(impl));
@@ -124,18 +114,8 @@ MetalLinear MetalLinear::from_weights(const LinearWeights& ref)
     auto packed = metal::Buffer::allocate(input_width * padded);
     auto* output = reinterpret_cast<std::int8_t*>(packed.mapped_bytes().data());
     const auto* input = reinterpret_cast<const std::int8_t*>(source.data().data());
-    std::fill_n(output, packed.size(), std::int8_t{0});
-    for (std::size_t tile = 0; tile < padded / rows; ++tile)
-    {
-        for (std::size_t quartet = 0; quartet < input_width / 4; ++quartet)
-        {
-            for (std::size_t row = 0; row < rows && tile * rows + row < output_width; ++row)
-            {
-                std::copy_n(input + (tile * rows + row) * input_width + quartet * 4, 4,
-                            output + (tile * input_width + quartet * 4) * rows + row * 4);
-            }
-        }
-    }
+    metal::pack_linear_weights({input, source.bytes}, input_width, output_width, rows,
+                               {output, packed.size()});
     return MetalLinear(std::make_shared<Impl>(
         Impl{input_width, output_width, metal::Buffer::import_weights(source),
              metal::Buffer::import_weights(scales), metal::Buffer::import_weights(bias),

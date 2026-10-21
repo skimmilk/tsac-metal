@@ -539,6 +539,12 @@ void decode_streams(const TransformerModel& model)
         check(gpu.decode(bytes) == tokens, "resident range decode changed tokens");
         if (h.frames == 197 && h.groups == 1)
         {
+            gpu.clear_session();
+            auto independent = gpu.new_session();
+            check(independent.decode(bytes) == tokens,
+                  "new session lost weights after releasing execution state");
+            check(gpu.decode(bytes) == tokens,
+                  "released Transformer session did not recreate execution state");
             Limits limits;
             // The old unpadded estimate plus 96 lookahead columns fits exactly;
             // the padded temporal allocation requires falling back instead.

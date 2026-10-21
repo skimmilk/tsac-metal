@@ -1,4 +1,5 @@
 #pragma once
+#include "common/execution.hpp"
 #include "common/signal.hpp"
 #include "weights/normalization.hpp"
 #include "weights/tensor_weights.hpp"
@@ -23,9 +24,13 @@ public:
                                      const Limits& limits = {});
     static Derived from_prepared(Conv1dConfig config, const weights::View& weights,
                                  const weights::View& bias, const Limits& limits);
+    // Preparation may borrow a recording's executor; all jobs complete before
+    // returning. Backends choose their final execution layout without a full
+    // expanded or normalized temporary.
     static Derived from_weights(const ConvolutionWeights& conv, const Limits& limits,
                                 std::size_t stride = 1, std::size_t dilation = 1,
-                                bool transposed = false);
+                                bool transposed = false,
+                                const ParallelExecutor* preparation = nullptr);
     std::size_t output_frames(std::size_t input_frames) const;
     // Scalar sums in tap/channel order; Apple uses BLAS reductions. Both add
     // bias once after all products. Out-of-bounds input is zero. Owns weights.
@@ -35,6 +40,8 @@ public:
                     const Limits& limits = {}) const;
 
 protected:
+    void prepare_dac_weights(const ConvolutionWeights& weights, const Limits& limits,
+                             const ParallelExecutor* execution);
     std::optional<std::size_t> source_frame(std::size_t frame, std::size_t tap) const;
     Conv1dConfig config_;
     std::vector<float> weights_;

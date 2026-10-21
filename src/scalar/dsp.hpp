@@ -16,6 +16,8 @@ public:
                   const Limits&) const;
 
 private:
+    friend class Convolution<Conv1d>;
+    Conv1d() = default;
     float sample(std::span<const float> input, SignalShape shape, std::size_t group,
                  std::size_t frame, std::size_t channel) const;
 };

@@ -2,6 +2,7 @@
 
 #include "common/internal.hpp"
 #include "metal/abi/kernel_contracts.hpp"
+#include "models/contract.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -16,7 +17,6 @@
 #include <exception>
 #include <mutex>
 #include <optional>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -168,7 +168,7 @@ Buffer Buffer::import_weights(const weights::View& view)
     detail::require(available() && view && view.offset <= view.mapping.size() &&
                         view.bytes <= view.mapping.size() - view.offset,
                     "invalid mapped Metal weights");
-    const auto page = static_cast<std::size_t>(getpagesize());
+    constexpr auto page = model_contract::mapping_alignment;
     detail::require(reinterpret_cast<std::uintptr_t>(view.mapping.data()) % page == 0 &&
                         view.mapping.size() % page == 0 &&
                         view.mapping.size() <= context().device.maxBufferLength,

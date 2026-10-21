@@ -94,6 +94,7 @@ if(TSAC_ENABLE_METAL)
     src/metal/audio_analyzer.cpp
     src/metal/audio_dac.cpp
     src/metal/audio_rvq.cpp
+    src/metal/weight_preparation.cpp
     src/metal/transformer.mm
     src/metal/transformer/model.mm
     src/metal/transformer/session.mm
@@ -223,6 +224,16 @@ if(BUILD_TESTING)
     endif()
   endif()
   if(UNIX)
+    add_executable(tsac-cpu-preparation tests/cpu_preparation.cpp)
+    target_link_libraries(tsac-cpu-preparation PRIVATE tsac_cpu)
+    target_include_directories(tsac-cpu-preparation PRIVATE src)
+    target_compile_definitions(tsac-cpu-preparation PRIVATE
+      TSAC_ENABLE_APPLE_ARM=$<BOOL:${TSAC_ENABLE_APPLE_ARM}>)
+    target_compile_options(tsac-cpu-preparation PRIVATE "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-ffp-contract=off>")
+    add_test(NAME cpu-preparation COMMAND "${CMAKE_COMMAND}"
+      "-DROOT=${CMAKE_CURRENT_BINARY_DIR}/weights/$<CONFIG>"
+      "-DPROGRAM=$<TARGET_FILE:tsac-cpu-preparation>"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_weights.cmake")
     add_executable(tsac-model-adapters-test
       tests/model_adapters.cpp src/weights/normalization.cpp src/weights/preparation.cpp)
     target_compile_options(tsac-model-adapters-test PRIVATE "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-ffp-contract=off>")
@@ -258,6 +269,14 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_BINARY_DIR}/metal/$<CONFIG>/probability.metallib")
     set_tests_properties(metal-abi PROPERTIES LABELS metal)
     if(TSAC_ENABLE_TRANSFORMER AND TSAC_ENABLE_APPLE_ARM)
+      add_executable(tsac-metal-preparation tests/metal_preparation.cpp)
+      target_link_libraries(tsac-metal-preparation PRIVATE tsac_cpu)
+      target_include_directories(tsac-metal-preparation PRIVATE src)
+      target_compile_options(tsac-metal-preparation PRIVATE -ffp-contract=off)
+      add_test(NAME metal-preparation COMMAND "${CMAKE_COMMAND}"
+        "-DROOT=${CMAKE_CURRENT_BINARY_DIR}/weights/$<CONFIG>"
+        "-DPROGRAM=$<TARGET_FILE:tsac-metal-preparation>"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/test_weights.cmake")
       add_executable(tsac-metal-optimized tests/metal_optimized.cpp)
       target_link_libraries(tsac-metal-optimized PRIVATE tsac_cpu)
       add_test(NAME metal-optimized COMMAND "${CMAKE_COMMAND}"

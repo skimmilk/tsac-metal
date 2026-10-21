@@ -39,14 +39,26 @@ std::vector<float> fold_dac_weight_norm(std::span<const float> v, std::span<cons
                                         std::size_t fan_in, const Limits& limits)
 {
     detail::require(fan_in > 0 && !g.empty(), "empty weight normalization shape");
+    detail::require(v.size() == checked_mul(fan_in, g.size()),
+                    "weight normalization shape mismatch");
+    detail::require(v.size() <= limits.tensor_elements, "normalized weight exceeds element limit");
+    std::vector<float> weights(v.size());
+    fold_dac_weight_norm_into(v, g, fan_in, weights, limits);
+    return weights;
+}
+
+void fold_dac_weight_norm_into(std::span<const float> v, std::span<const float> g,
+                               std::size_t fan_in, std::span<float> weights, const Limits& limits)
+{
+    detail::require(fan_in > 0 && !g.empty(), "empty weight normalization shape");
     const auto count = checked_mul(fan_in, g.size());
-    detail::require(v.size() == count, "weight normalization shape mismatch");
+    detail::require(v.size() == count && weights.size() == count,
+                    "weight normalization shape mismatch");
     detail::require(count <= limits.tensor_elements, "normalized weight exceeds element limit");
     detail::require_finite(v, "nonfinite weight normalization value");
     detail::require_finite(g, "nonfinite weight normalization value");
     const float inverse_width = 1.0f / std::sqrt(static_cast<float>(fan_in));
     const float reciprocal_width = 1.0f / static_cast<float>(fan_in);
-    std::vector<float> weights(count);
     std::vector<float> squares(fan_in);
     for (std::size_t column_index = 0; column_index < g.size(); ++column_index)
     {
@@ -79,6 +91,5 @@ std::vector<float> fold_dac_weight_norm(std::span<const float> v, std::span<cons
         }
     }
     detail::require_finite(weights, "nonfinite weight normalization value");
-    return weights;
 }
 } // namespace tsac

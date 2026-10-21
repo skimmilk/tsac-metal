@@ -21,6 +21,7 @@ public:
                   const Limits& limits) const;
 
 private:
+    friend class Convolution<Conv1d>;
     Conv1d() = default;
 
     struct Phase
@@ -36,6 +37,9 @@ private:
     };
 
     void prepare_transposed(std::span<const float> weights);
+    void prepare_phases();
+    void prepare_dac_weights(const ConvolutionWeights& weights, const Limits& limits,
+                             const ParallelExecutor* execution);
     void lower_tile(std::span<const float> input, SignalShape shape, const Tile& tile,
                     std::span<float> columns) const;
     void apply_tile(std::span<const float> input, SignalShape shape, Signal& output,

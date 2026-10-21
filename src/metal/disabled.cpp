@@ -147,10 +147,13 @@ MetalTransformer::MetalTransformer(MetalTransformer&&) noexcept = default;
 MetalTransformer& MetalTransformer::operator=(MetalTransformer&&) noexcept = default;
 GPU_STUB(MetalTransformer, MetalTransformer::from_model, (TransformerModel, const Limits&))
 GPU_STUB(MetalTransformer, MetalTransformer::new_session, () const)
+GPU_STUB(void, MetalTransformer::clear_session, ())
 GPU_STUB(Bytes, MetalTransformer::encode,
          (Header, std::span<const std::uint16_t>, const EntropyObserver&))
 GPU_STUB(std::vector<std::uint16_t>, MetalTransformer::decode, (ByteView, const EntropyObserver&))
 GPU_STUB(MetalLinear, MetalLinear::from_weights, (const LinearWeights&))
+GPU_STUB(MetalConvolution, MetalConvolution::from_weights,
+         (Conv1dConfig, const ConvolutionWeights&, const Limits&))
 GPU_STUB(MetalLinear, MetalLinear::prepare,
          (std::size_t, std::size_t, std::span<const std::int8_t>, std::span<const float>,
           std::span<const float>))

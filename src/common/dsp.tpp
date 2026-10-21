@@ -25,6 +25,30 @@ inline std::size_t weight_count(const Conv1dConfig& config, const Limits& limits
     detail::require(count <= limits.tensor_elements, "convolution weights exceed element limit");
     return count;
 }
+
+inline void prepare_weight_tiles(std::size_t columns, std::size_t count,
+                                 const ParallelExecutor* execution,
+                                 const std::function<void(std::size_t, std::size_t)>& prepare)
+{
+    constexpr std::size_t tile = 32;
+    const auto jobs = (columns + tile - 1) / tile;
+    const auto task = [&](std::size_t job)
+    {
+        const auto first = job * tile;
+        prepare(first, std::min(tile, columns - first));
+    };
+    if (execution && execution->parallel() && count >= 65536)
+    {
+        execution->parallel_for(jobs, task);
+    }
+    else
+    {
+        for (std::size_t job = 0; job < jobs; ++job)
+        {
+            task(job);
+        }
+    }
+}
 } // namespace detail
 
 template <class Derived>
@@ -70,7 +94,7 @@ Derived Convolution<Derived>::from_prepared(Conv1dConfig config, const weights::
 template <class Derived>
 Derived Convolution<Derived>::from_weights(const ConvolutionWeights& c, const Limits& limits,
                                            std::size_t stride, std::size_t dilation,
-                                           bool transposed)
+                                           bool transposed, const ParallelExecutor* preparation)
 {
     const auto shape = c.values.shape().axes;
     const auto first = shape[0], kernel = shape[1], last = shape[2];
@@ -84,11 +108,34 @@ Derived Convolution<Derived>::from_weights(const ConvolutionWeights& c, const Li
     detail::require(c.values.shape().elements() == detail::weight_count(config, limits),
                     "invalid stored convolution shape");
     const auto bias = weights::View(c.bias);
-    auto folded =
-        fold_dac_weight_norm(weights::expand(c.values), c.gain.values(), first * kernel, limits);
-    auto result = Derived(config, folded, bias.as<float>(), limits);
+    detail::require(c.gain.size() == last && c.bias.size() == config.output_channels,
+                    "normalized convolution shape mismatch");
+    detail::require_finite(c.bias.values(), "nonfinite DSP value");
+    Derived result;
+    result.config_ = config;
     result.bias_ = weights::Array<float>(bias);
+    result.prepare_dac_weights(c, limits, preparation);
     return result;
+}
+
+template <class Derived>
+void Convolution<Derived>::prepare_dac_weights(const ConvolutionWeights& c, const Limits& limits,
+                                               const ParallelExecutor* execution)
+{
+    const auto axes = c.values.shape().axes;
+    const auto fan_in = axes[0] * axes[1];
+    weights_.resize(c.values.shape().elements());
+    const auto gain = c.gain.values();
+    detail::prepare_weight_tiles(
+        axes[2], weights_.size(), execution,
+        [&](std::size_t first, std::size_t width)
+        {
+            // Ordinary Apple convolutions and the scalar reference consume the
+            // stored column layout directly. Expand/fold in the final allocation.
+            auto values = std::span(weights_).subspan(first * fan_in, width * fan_in);
+            weights::expand_into(c.values, first * fan_in, values);
+            fold_dac_weight_norm_into(values, gain.subspan(first, width), fan_in, values, limits);
+        });
 }
 
 template <class Derived> std::size_t Convolution<Derived>::output_frames(std::size_t frames) const
