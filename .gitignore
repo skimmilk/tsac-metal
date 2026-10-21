@@ -2,6 +2,7 @@
 /original/
 /models/
 /build*/
+/gpu-captures/
 __pycache__/
 *.f32
 .DS_Store

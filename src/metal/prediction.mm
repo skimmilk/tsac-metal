@@ -9,9 +9,11 @@
 
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 
 namespace tsac
@@ -170,13 +172,21 @@ struct Prediction::Impl
         Pipeline pipeline;
     };
 
-    Buffer error = Buffer::allocate(sizeof(std::uint32_t));
+    struct Slot
+    {
+        Buffer error = Buffer::allocate(sizeof(std::uint32_t));
+        std::vector<Buffer> staging;
+        Ticket ticket = 0;
+    };
+
+    std::array<Slot, 2> slots;
+    std::size_t recording_slot = 0;
+    Buffer error = slots[0].error;
     bool fuse_projections = false;
     BufferStorage scratch_storage = BufferStorage::shared;
     std::unique_ptr<ExecutionContext> execution;
     // CPU-populated staging never aliases GPU scratch. Its cursor advances for
     // the entire submission, even when recycle() reuses GPU-only activations.
-    std::vector<Buffer> staging;
     std::size_t staging_cursor = 0;
     // One caller owns begin/record/finish. Activation slots remain distinct
     // until recycle() follows their last recorded consumer. Operations retain
@@ -185,6 +195,10 @@ struct Prediction::Impl
     std::vector<Operation> operations;
     std::vector<Program::Dispatch> dispatches;
     std::size_t scratch_cursor = 0, operation_cursor = 0;
+    using Clock = std::chrono::steady_clock;
+    bool profile = std::getenv("TSAC_METAL_PROFILE") != nullptr;
+    Clock::time_point recording_started;
+    std::uint64_t recording_ns = 0, finalizing_ns = 0;
 
     template <class T>
     void record(std::string_view name, std::initializer_list<ResourceBinding> args,
@@ -201,7 +215,24 @@ struct Prediction::Impl
             op.pipeline = program().resolve(name);
         }
         op.kernel = name;
-        op.arguments.assign(args);
+        if (op.arguments.size() != args.size())
+        {
+            op.arguments.assign(args);
+        }
+        else
+        {
+            auto* destination = op.arguments.data();
+            for (const auto& argument : args)
+            {
+                // Repeated decoding chunks keep most bindings identical.
+                // Avoid retaining/releasing their shared owners again.
+                if (destination->index != argument.index || destination->buffer != argument.buffer)
+                {
+                    *destination = argument;
+                }
+                ++destination;
+            }
+        }
         op.threads = threads;
         op.width = width;
         const auto bytes = std::as_bytes(std::span(&p, 1));
@@ -226,6 +257,7 @@ Prediction::Prediction(std::shared_ptr<const ResidencySet> model_resources)
 void Prediction::reset_session(std::shared_ptr<const ResidencySet> session_resources)
 {
     detail::require(impl_->execution != nullptr, "Prediction has no persistent execution context");
+    drain();
     impl_->dispatches.clear();
     impl_->operations.clear();
     impl_->operation_cursor = 0;
@@ -236,6 +268,13 @@ void Prediction::reset_session(std::shared_ptr<const ResidencySet> session_resou
 
 Prediction::~Prediction()
 {
+    try
+    {
+        drain();
+    }
+    catch (...)
+    {
+    }
     if (std::getenv("TSAC_METAL_PROFILE"))
     {
         std::size_t bytes = 0;
@@ -245,6 +284,8 @@ Prediction::~Prediction()
         }
         std::fprintf(stderr, "Metal probability scratch: slots=%zu capacity_bytes=%zu\n",
                      impl_->scratch.size(), bytes);
+        std::fprintf(stderr, "Metal probability host: record=%.6f finalize=%.6f seconds\n",
+                     double(impl_->recording_ns) / 1e9, double(impl_->finalizing_ns) / 1e9);
     }
 }
 
@@ -260,6 +301,13 @@ void Prediction::recycle()
 
 void Prediction::begin()
 {
+    auto& slot = impl_->slots[impl_->recording_slot];
+    wait(slot.ticket);
+    impl_->error = slot.error;
+    if (impl_->profile)
+    {
+        impl_->recording_started = Impl::Clock::now();
+    }
     impl_->staging_cursor = 0;
     impl_->scratch_cursor = 0;
     impl_->operation_cursor = 0;
@@ -288,7 +336,7 @@ Buffer Prediction::temporary(std::size_t bytes)
 
 Buffer Prediction::shared_temporary(std::size_t bytes)
 {
-    auto& slots = impl_->staging;
+    auto& slots = impl_->slots[impl_->recording_slot].staging;
     const auto i = impl_->staging_cursor++;
     if (i == slots.size())
     {
@@ -883,8 +931,9 @@ void Prediction::copy(const Buffer& source, const Buffer& destination)
         p.element_count, p);
 }
 
-void Prediction::finish()
+Prediction::Ticket Prediction::submit()
 {
+    const auto started = impl_->profile ? Impl::Clock::now() : Impl::Clock::time_point{};
     impl_->dispatches.clear();
     for (std::size_t i = 0; i < impl_->operation_cursor; ++i)
     {
@@ -892,11 +941,101 @@ void Prediction::finish()
         impl_->dispatches.push_back(
             {op.kernel, op.arguments, op.threads, op.width, op.parameters, &op.pipeline});
     }
-    impl_->execution->run(impl_->dispatches);
-    std::uint32_t error = 0;
-    impl_->error.read(&error, sizeof error);
-    detail::require(!(error & 2u), "invalid Metal range state");
-    detail::require(!error, "nonfinite Metal Transformer activation");
+    if (impl_->profile)
+    {
+        impl_->recording_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(started - impl_->recording_started)
+                .count());
+        impl_->finalizing_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Impl::Clock::now() - started)
+                .count());
+    }
+    auto& slot = impl_->slots[impl_->recording_slot];
+    detail::require(!slot.ticket, "Prediction slot is still in flight");
+    const auto ticket = impl_->execution->submit(impl_->dispatches);
+    slot.ticket = ticket;
+    impl_->recording_slot = (impl_->recording_slot + 1) % impl_->slots.size();
+    if (!ticket)
+    {
+        // Empty batches have no GPU completion to wait for.
+        std::uint32_t error = 0;
+        slot.error.read(&error, sizeof error);
+        detail::require(!(error & 2u), "invalid Metal range state");
+        detail::require(!error, "nonfinite Metal Transformer activation");
+    }
+    return ticket;
 }
+
+void Prediction::wait(Ticket ticket)
+{
+    if (!ticket)
+    {
+        return;
+    }
+    std::exception_ptr failure;
+    try
+    {
+        impl_->execution->wait(ticket);
+    }
+    catch (...)
+    {
+        failure = std::current_exception();
+        // Even a rejected ticket or a host exception must not let us inspect
+        // error words while another queued command may still be writing them.
+        try
+        {
+            impl_->execution->drain();
+        }
+        catch (...)
+        {
+        }
+    }
+    // Completion of a later ticket also completes its producers. Check their
+    // error words in submission order before allowing either slot to be reused.
+    for (std::size_t i = 0; i < impl_->slots.size(); ++i)
+    {
+        Impl::Slot* first = nullptr;
+        for (auto& slot : impl_->slots)
+        {
+            if (slot.ticket && slot.ticket <= ticket && (!first || slot.ticket < first->ticket))
+            {
+                first = &slot;
+            }
+        }
+        if (!first)
+        {
+            break;
+        }
+        first->ticket = 0;
+        std::uint32_t error = 0;
+        first->error.read(&error, sizeof error);
+        if (error && !failure)
+        {
+            failure = std::make_exception_ptr(
+                Error((error & 2u) ? "invalid Metal range state"
+                                   : "nonfinite Metal Transformer activation"));
+        }
+    }
+    if (failure)
+    {
+        std::rethrow_exception(failure);
+    }
+}
+
+void Prediction::drain()
+{
+    Ticket last = 0;
+    for (const auto& slot : impl_->slots)
+    {
+        last = std::max(last, slot.ticket);
+    }
+    wait(last);
+}
+
+void Prediction::finish()
+{
+    wait(submit());
+}
+
 } // namespace metal
 } // namespace tsac

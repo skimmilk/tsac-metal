@@ -21,9 +21,14 @@ minimum. The [shared parameter ABI](abi/README.md) defines the host/shader contr
 ## Unified memory and execution
 
 All inference records through `ExecutionContext`, which retains its own Metal 4
-queue, command allocator, command buffer, argument table, parameter arena, and
-residency sets. `Program` owns the library and resolves pipelines; it has no
-separate submission path. Command memory is reset only after completion feedback.
+queue and two submission slots. Each slot owns its command allocator, command
+buffer, argument table, parameter arena, transient residency, retained pipelines,
+and completion feedback. `Program` owns the library and resolves pipelines; it
+has no separate submission path. `submit()` commits without waiting and returns
+a ticket; `wait()` retires tickets in queue order, and `drain()` completes all
+outstanding work. Reusing a busy slot waits for its completion first. Existing
+`run()` callers remain synchronous. Session replacement and destruction also
+drain the queue before releasing resources.
 This follows Apple's [Metal 4 resource and command model](https://developer.apple.com/videos/play/wwdc2025/205/).
 The runtime explicitly requires a GPU with unified memory.
 
@@ -48,8 +53,25 @@ alignment, lifetime, and exclusive access are not owned by the backend.
 CPU-populated staging stays separate from recycled GPU scratch. Each recorded
 CPU input gets a distinct range until the chunk completes, even if the graph
 has released its last GPU consumer. Explicit dispatch barriers order GPU writes
-and scratch reuse. `begin()` reuses staging only after `finish()` has completed;
-borrowed results must be consumed before the next chunk overwrites them.
+and scratch reuse. `Prediction` alternates two CPU staging/error-word slots;
+`begin()` waits before reusing a busy slot, while `finish()` remains synchronous.
+Borrowed scratch results must be consumed before the next chunk overwrites them.
+
+Resident probability decoding keeps at most two ten-step chunks submitted on the
+same queue. While the GPU executes one chunk, the CPU records and commits the
+next. The queue-level dispatch barrier preserves shared token/range state, KV
+caches, probabilities, and GPU-only scratch dependencies across submissions.
+Only CPU-written staging, scalar parameters, and error words need separate
+storage. Progress callbacks remain ordered and run after their chunk completes.
+Context replay drains pending chunks and remains synchronous; final token reads,
+CRC checks, exceptions, and teardown also drain outstanding consumers. This
+pipeline overlaps host preparation with GPU execution; it does not reduce the
+number of dispatches or change model arithmetic.
+
+With `TSAC_METAL_PROFILE`, `wait` measures time blocked on completion feedback.
+Preparation of a later asynchronous submission can overlap earlier GPU time, so
+`encode + wait` is not the full decode elapsed time; graph recording and other
+host work are outside those counters. `gpu` sums command execution intervals.
 
 The Transformer host range encoder writes softmax output directly to shared
 buffers, then converts the mapped BF16 values after completion. Known-token
@@ -95,6 +117,8 @@ The active Xcode SDK supplies `metal` and `metallib` through `xcrun`. For a sepa
 toolchain, set the CMake cache paths `TSAC_METAL_COMPILER` and `TSAC_METAL_LINKER`.
 
 ## Probability and entropy
+
+### Shader organization
 
 `probability/` contains the deterministic Transformer and range decoder:
 

@@ -30,7 +30,7 @@ void dispatch_constants_and_views(metal::ExecutionContext& execution)
         values[i] = probability_bf16(static_cast<float>(i));
     }
     // The view remains the owner after the original allocation handle goes away.
-    const auto input = metal::Buffer::copy(values.data(), sizeof values).slice(4, 64);
+    const auto input = metal::Buffer::copy(values.data(), sizeof values).slice(4, 66);
     const std::array right_values{probability_bf16(1), probability_bf16(2), probability_bf16(3),
                                   probability_bf16(4)};
     const auto right = metal::Buffer::copy(right_values.data(), sizeof right_values);
@@ -42,7 +42,7 @@ void dispatch_constants_and_views(metal::ExecutionContext& execution)
         // Resource order intentionally differs from slot order.
         bindings.push_back({metal::bind(abi::add_binding::output, outputs.back()),
                             metal::bind(abi::add_binding::right, right),
-                            metal::bind(abi::add_binding::input, input)});
+                            metal::bind(abi::add_binding::input, input.slice((i % 2) * 2, 64))});
     }
     std::vector<metal::Program::Dispatch> dispatches;
     dispatches.reserve(count);
@@ -58,16 +58,17 @@ void dispatch_constants_and_views(metal::ExecutionContext& execution)
         outputs[i].read(actual.data(), sizeof actual);
         for (std::size_t j = 0; j < count; ++j)
         {
-            const auto expected = j < parameters[i].element_count
-                                      ? probability_bf16(static_cast<float>(
-                                            j + 2 + j % parameters[i].right_period_elements + 1))
-                                      : 0;
+            const auto expected =
+                j < parameters[i].element_count
+                    ? probability_bf16(static_cast<float>(
+                          j + 2 + i % 2 + j % parameters[i].right_period_elements + 1))
+                    : 0;
             check(actual[j] == expected, "Metal 4 parameter snapshots or buffer view changed");
         }
     }
 }
 
-void dependency_and_recovery(metal::ExecutionContext& execution)
+void dependency_and_recovery(const metal::Program& program, metal::ExecutionContext& execution)
 {
     const std::array values{probability_bf16(1), probability_bf16(2), probability_bf16(3),
                             probability_bf16(4)};
@@ -97,14 +98,18 @@ void dependency_and_recovery(metal::ExecutionContext& execution)
         }
         check(rejected, "Invalid or duplicate argument-table slot was accepted");
     }
+    const auto copy_pipeline = program.resolve("copy_bf16");
+    const auto add_pipeline = program.resolve("add_kernel");
     const std::array<metal::Program::Dispatch, 2> dispatches{
-        {{"copy_bf16", copy_bindings, 4, 0, std::as_bytes(std::span(&copy, 1))},
-         {"add_kernel", add_bindings, 4, 0, std::as_bytes(std::span(&add, 1))}}};
+        {{"copy_bf16", copy_bindings, 4, 0, std::as_bytes(std::span(&copy, 1)), &copy_pipeline},
+         {"add_kernel", add_bindings, 4, 0, std::as_bytes(std::span(&add, 1)), &add_pipeline}}};
     for (const auto& invalid :
          {metal::Program::Dispatch{"copy_bf16", copy_bindings, 4, 0,
                                    std::as_bytes(std::span(&add, 1))},
           metal::Program::Dispatch{"copy_bf16", std::span(copy_bindings).first(1), 4, 0,
-                                   std::as_bytes(std::span(&copy, 1))}})
+                                   std::as_bytes(std::span(&copy, 1))},
+          metal::Program::Dispatch{"copy_bf16", copy_bindings, 4, 0,
+                                   std::as_bytes(std::span(&copy, 1)), &add_pipeline}})
     {
         bool rejected = false;
         try
@@ -186,6 +191,57 @@ void shared_cpu_gpu_views(metal::ExecutionContext& execution)
     }
 }
 
+// Reuse GPU scratch across submissions while destroying dispatch descriptions
+// and their parameter bytes immediately after commit. The third submission
+// also exercises automatic retirement before reusing a busy command slot.
+void queued_dependencies(const metal::Program& program)
+{
+    const std::array values{probability_bf16(1), probability_bf16(2), probability_bf16(3),
+                            probability_bf16(4)};
+    const auto scratch = metal::Buffer::copy(values.data(), sizeof values);
+    const auto output = metal::Buffer::allocate(sizeof values);
+    {
+        metal::ExecutionContext execution(program);
+        metal::ExecutionContext::Ticket previous = 0;
+        for (unsigned chunk = 0; chunk < 5; ++chunk)
+        {
+            const auto temporary = metal::Buffer::allocate(sizeof values);
+            abi::CopyParams copy{4};
+            abi::AddParams add{4, 4};
+            auto pipeline = program.resolve("add_kernel");
+            const std::array copy_bindings{metal::bind(abi::copy_binding::input, scratch),
+                                           metal::bind(abi::copy_binding::output, temporary)};
+            const std::array add_bindings{metal::bind(abi::add_binding::input, temporary),
+                                          metal::bind(abi::add_binding::right, temporary),
+                                          metal::bind(abi::add_binding::output, scratch)};
+            const std::array dispatches{
+                metal::Program::Dispatch{"copy_bf16", copy_bindings, 4, 0,
+                                         std::as_bytes(std::span(&copy, 1))},
+                metal::Program::Dispatch{"add_kernel", add_bindings, 4, 0,
+                                         std::as_bytes(std::span(&add, 1)), &pipeline}};
+            const auto ticket = execution.submit(dispatches);
+            check(ticket > previous, "Active submission ticket is zero or out of order");
+            previous = ticket;
+            copy.element_count = add.element_count = 0;
+        }
+        // Synchronous callers must also drain prior queued producers.
+        const abi::CopyParams copy{4};
+        const std::array bindings{metal::bind(abi::copy_binding::input, scratch),
+                                  metal::bind(abi::copy_binding::output, output)};
+        const metal::Program::Dispatch dispatch{"copy_bf16", bindings, 4, 0,
+                                                std::as_bytes(std::span(&copy, 1))};
+        execution.run(std::span(&dispatch, 1));
+        // Teardown must complete an outstanding submission as well.
+        execution.submit(std::span(&dispatch, 1));
+    }
+    const auto actual = output.mapped<std::uint16_t>();
+    for (std::size_t i = 0; i < actual.size(); ++i)
+    {
+        check(actual[i] == probability_bf16(float(32 * (i + 1))),
+              "Queued submission lost resource lifetime, constants or dependency ordering");
+    }
+}
+
 int main(int argc, char** argv)
 {
     try
@@ -195,8 +251,9 @@ int main(int argc, char** argv)
         const auto program = metal::Program::load(std::as_bytes(std::span(bytes)), "ABI tests");
         metal::ExecutionContext execution(program);
         dispatch_constants_and_views(execution);
-        dependency_and_recovery(execution);
+        dependency_and_recovery(program, execution);
         shared_cpu_gpu_views(execution);
+        queued_dependencies(program);
         std::cout << "Metal 4 ABI checks passed\n";
         return 0;
     }

@@ -6,9 +6,9 @@
 namespace tsac::metal
 {
 // Reusable recorder for a prediction or a bounded decoding chunk. Intermediate
-// activations remain on Metal, with one completion boundary per recorded graph.
-// One exclusive caller owns recording and scratch reuse. Prepared weights can
-// be shared; recorded buffers and the error word survive graph completion.
+// activations remain on Metal. One exclusive caller owns recording and scratch
+// reuse; two submitted chunks can overlap CPU preparation with GPU execution.
+// Prepared weights can be shared. Slot resources survive until completion.
 class Prediction
 {
 public:
@@ -71,6 +71,14 @@ public:
                       const Buffer& state, const Buffer& tokens, const Header& header,
                       std::size_t step, std::size_t book, std::size_t columns);
     void copy(const Buffer& source, const Buffer& destination);
+    using Ticket = ExecutionContext::Ticket;
+    // Two recording slots retain separate CPU staging and error words. begin()
+    // waits before reusing a busy slot. GPU-only scratch stays shared and is
+    // ordered by the execution queue's dispatch barriers. wait() also checks
+    // all earlier tickets' error words; finish() submits and waits synchronously.
+    Ticket submit();
+    void wait(Ticket ticket);
+    void drain();
     void finish();
 
 private:

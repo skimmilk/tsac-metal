@@ -27,6 +27,72 @@ void check(bool ok, const char* text)
     }
 }
 
+void prediction_slots(const TransformerModel& model)
+{
+    metal::Prediction graph;
+    auto weights = MetalLinear::from_weights(model.temporal_projection());
+    // Invalid input in slot A must survive clearing/using slot B's error word.
+    graph.begin();
+    std::vector<std::uint16_t> invalid(
+        apple_arm::PackedLinear::from_weights(model.temporal_projection()).input_width(), 0x7f80);
+    graph.linear(weights, graph.upload(invalid));
+    const auto bad = graph.submit();
+    graph.begin();
+    const std::array values{probability_bf16(3), probability_bf16(7)};
+    const auto output = metal::Buffer::allocate(sizeof values);
+    graph.copy(graph.upload(values), output);
+    const auto good = graph.submit();
+    bool rejected = false;
+    try
+    {
+        graph.wait(good);
+    }
+    catch (const Error&)
+    {
+        rejected = true;
+    }
+    check(rejected, "Second slot cleared the first slot's GPU error");
+    graph.wait(bad);
+    graph.wait(good);
+    check(std::equal(values.begin(), values.end(), output.mapped<std::uint16_t>().begin()),
+          "Queued prediction staging was overwritten");
+    // Reuse both slots after an error, with different CPU-populated input.
+    for (unsigned pair = 0; pair < 3; ++pair)
+    {
+        std::array<metal::Buffer, 2> outputs{metal::Buffer::allocate(sizeof values),
+                                             metal::Buffer::allocate(sizeof values)};
+        for (unsigned slot = 0; slot < 2; ++slot)
+        {
+            graph.begin();
+            const std::array input{probability_bf16(float(pair * 2 + slot)),
+                                   probability_bf16(float(pair * 2 + slot + 1))};
+            graph.copy(graph.upload(input), outputs[slot]);
+            graph.submit();
+        }
+        if (!pair)
+        {
+            bool invalid_ticket = false;
+            try
+            {
+                graph.wait(std::numeric_limits<metal::Prediction::Ticket>::max());
+            }
+            catch (const Error&)
+            {
+                invalid_ticket = true;
+            }
+            check(invalid_ticket, "Prediction accepted an unknown submission ticket");
+        }
+        graph.drain();
+        for (unsigned slot = 0; slot < 2; ++slot)
+        {
+            const auto actual = outputs[slot].mapped<std::uint16_t>();
+            check(actual[0] == probability_bf16(float(pair * 2 + slot)) &&
+                      actual[1] == probability_bf16(float(pair * 2 + slot + 1)),
+                  "Prediction slot reuse changed staged CPU input");
+        }
+    }
+}
+
 void projections(const TransformerModel& model)
 {
     metal::Prediction graph;
@@ -556,6 +622,25 @@ void resident_streams(const TransformerModel& model, unsigned channels, unsigned
             rejected = true;
         }
         check(rejected, "resident decode accepted invalid initial interval");
+        if (h.frames == 71)
+        {
+            bool interrupted = false;
+            try
+            {
+                gpu.decode(bytes, {[&](const auto&)
+                                   {
+                                       throw Error("observer stopped decode");
+                                   },
+                                   {}});
+            }
+            catch (const Error&)
+            {
+                interrupted = true;
+            }
+            check(interrupted, "Observer did not interrupt queued decode");
+            check(gpu.decode(bytes) == tokens,
+                  "Session could not recover after observer exception");
+        }
         std::cout << "resident channels=" << channels << " frames=" << h.frames
                   << " batch=" << h.batch << " passed\n";
     }
@@ -745,6 +830,7 @@ int main(int argc, char** argv)
         const std::filesystem::path root = argv[1];
         const ModelDirectory directory(root);
         const TransformerModel model(directory, ModelVariant::stereo, 12);
+        prediction_slots(model);
         projections(model);
         projection_format_edges(model);
         normalized_projections(model);

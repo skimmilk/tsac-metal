@@ -33,7 +33,8 @@ Installation includes the executable, runtime assets, and documentation with
 the original notice.
 
 CPU is the default; `--metal` enables GPU execution.
-The Metal backend may be faster or slower depending on your hardware. On the M1, Metal is 12.2% slower than CPU.
+The Metal backend may be faster or slower depending on your hardware. On this M1,
+Metal took 8–9% longer than CPU in the benchmark below.
 
 Commands are `c` (compress), `d` (decompress), and `t` (compress then decompress).
 Original CLI options retained:
@@ -45,10 +46,11 @@ the option descriptions.
 
 Benchmark measurements on an Apple M1
 (8 physical CPU cores), macOS 27.0.1, Release build, using approximately
-30 seconds of music at 44.1 kHz in joint stereo:
+30 seconds of music at 44.1 kHz in joint stereo, maximum quality (12 codebooks),
+entropy batch size 3, and 8 CPU workers:
 
-- Encode: CPU **9.68 s**; Metal **10.64 s** (1.10× the CPU time).
-- Decode: CPU **14.14 s**; Metal **16.09 s** (1.14× the CPU time).
+- Encode: CPU **9.39 s**; Metal **10.21 s** (1.09× the CPU time).
+- Decode: CPU **13.54 s**; Metal **14.60 s** (1.08× the CPU time).
 
 Native input is 44.1 kHz PCM16 WAVE or signed little-endian raw `.sw`. Other
 formats, sample-rate conversion, and explicit WAVE channel conversion use

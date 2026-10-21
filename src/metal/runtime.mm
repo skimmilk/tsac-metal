@@ -13,10 +13,12 @@
 #include <cstdlib>
 #include <cstring>
 #import <dispatch/dispatch.h>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tsac::metal
 {
@@ -64,11 +66,13 @@ NSString* string(std::string_view text)
     detail::require(result != nil, "Metal function name is not UTF-8");
     return result;
 }
+
 } // namespace
 
 struct Buffer::Impl
 {
     id<MTLBuffer> buffer;
+    MTLGPUAddress gpu_address;
     std::size_t bytes;
     BufferStorage storage;
     bool read_only = false;
@@ -78,6 +82,8 @@ struct Pipeline::Impl
 {
     id<MTLComputePipelineState> pipeline;
     std::string kernel;
+    std::size_t max_threads;
+    const abi::KernelContract* contract;
 };
 
 struct Program::Impl
@@ -89,6 +95,8 @@ struct Program::Impl
     bool profile = std::getenv("TSAC_METAL_PROFILE") != nullptr;
     mutable std::atomic<std::uint64_t> submissions{0}, dispatches{0}, encoding_ns{0}, wait_ns{0},
         gpu_ns{0};
+    mutable std::atomic<std::uint64_t> validation_ns{0}, residency_ns{0}, preparation_ns{0},
+        commands_ns{0};
 
     ~Impl()
     {
@@ -101,6 +109,12 @@ struct Program::Impl
                          static_cast<unsigned long long>(dispatches.load()),
                          double(encoding_ns.load()) / 1e9, double(wait_ns.load()) / 1e9,
                          double(gpu_ns.load()) / 1e9);
+            std::fprintf(stderr,
+                         "Metal host profile %s: validate=%.6f residency=%.6f prepare=%.6f "
+                         "commands=%.6f seconds\n",
+                         label.c_str(), double(validation_ns.load()) / 1e9,
+                         double(residency_ns.load()) / 1e9, double(preparation_ns.load()) / 1e9,
+                         double(commands_ns.load()) / 1e9);
         }
     }
 };
@@ -133,6 +147,7 @@ Buffer Buffer::allocate(std::size_t bytes, BufferStorage storage)
                         options:storage == BufferStorage::shared ? MTLResourceStorageModeShared
                                                                  : MTLResourceStorageModePrivate];
         detail::require(impl->buffer != nil, "cannot allocate Metal buffer");
+        impl->gpu_address = impl->buffer.gpuAddress;
         return Buffer(std::move(impl));
     }
 }
@@ -192,6 +207,7 @@ Buffer Buffer::import_weights(const weights::View& view)
                                          (void)owner;
                                        }];
     detail::require(impl->buffer != nil, "cannot import mapped Metal weights");
+    impl->gpu_address = impl->buffer.gpuAddress;
     imports[view.mapping.data()] = impl;
     return Buffer(std::move(impl)).slice(view.offset, view.bytes);
 }
@@ -299,14 +315,29 @@ struct ExecutionContext::Impl
     Program program;
     std::shared_ptr<const ResidencySet> model, session;
     id<MTL4CommandQueue> queue API_AVAILABLE(macos(26.0));
-    id<MTL4CommandAllocator> allocator API_AVAILABLE(macos(26.0));
-    id<MTL4CommandBuffer> command API_AVAILABLE(macos(26.0));
-    id<MTL4ArgumentTable> table API_AVAILABLE(macos(26.0));
-    id<MTLResidencySet> transient;
-    NSSet<id<MTLBuffer>>* transient_allocations;
-    std::optional<Buffer> parameters;
-    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
-    bool running = false;
+
+    struct Completion
+    {
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        id<MTL4CommitFeedback> feedback API_AVAILABLE(macos(26.0));
+    };
+
+    struct Slot
+    {
+        id<MTL4CommandAllocator> allocator API_AVAILABLE(macos(26.0));
+        id<MTL4CommandBuffer> command API_AVAILABLE(macos(26.0));
+        id<MTL4ArgumentTable> table API_AVAILABLE(macos(26.0));
+        id<MTLResidencySet> transient;
+        NSSet<id<MTLBuffer>>* transient_allocations;
+        std::optional<Buffer> parameters;
+        std::unordered_set<MTLGPUAddress> seen_allocations;
+        std::vector<Pipeline> pipelines;
+        std::shared_ptr<Completion> completion;
+        Ticket ticket = 0;
+    };
+
+    std::array<Slot, 2> slots;
+    Ticket next_ticket = 1, retired = 0;
 };
 
 ExecutionContext::ExecutionContext(const Program& program,
@@ -320,10 +351,7 @@ ExecutionContext::ExecutionContext(const Program& program,
             detail::require(available(), "Metal 4 requires macOS 26 and a supported Apple GPU");
             impl_->model = std::move(model);
             impl_->queue = [context().device newMTL4CommandQueue];
-            impl_->allocator = [context().device newCommandAllocator];
-            impl_->command = [context().device newCommandBuffer];
-            detail::require(impl_->queue && impl_->allocator && impl_->command,
-                            "Cannot allocate Metal 4 execution context");
+            detail::require(impl_->queue != nil, "Cannot allocate Metal 4 queue");
             if (impl_->model)
             {
                 [impl_->queue addResidencySet:impl_->model->impl_->set];
@@ -331,15 +359,20 @@ ExecutionContext::ExecutionContext(const Program& program,
             MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
             descriptor.maxBufferBindCount = 31;
             descriptor.initializeBindings = YES;
-            NSError* error = nil;
-            impl_->table = [context().device newArgumentTableWithDescriptor:descriptor
-                                                                      error:&error];
-            detail::require(impl_->table != nil, "Cannot create Metal 4 argument table");
-            MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
-            impl_->transient = [context().device newResidencySetWithDescriptor:residency
-                                                                         error:&error];
-            detail::require(impl_->transient != nil, "Cannot create transient Metal residency set");
-            impl_->transient_allocations = [NSSet new];
+            for (auto& slot : impl_->slots)
+            {
+                slot.allocator = [context().device newCommandAllocator];
+                slot.command = [context().device newCommandBuffer];
+                NSError* error = nil;
+                slot.table = [context().device newArgumentTableWithDescriptor:descriptor
+                                                                        error:&error];
+                MTLResidencySetDescriptor* residency = [MTLResidencySetDescriptor new];
+                slot.transient = [context().device newResidencySetWithDescriptor:residency
+                                                                           error:&error];
+                detail::require(slot.allocator && slot.command && slot.table && slot.transient,
+                                "Cannot allocate Metal 4 submission slot");
+                slot.transient_allocations = [NSSet new];
+            }
         }
         else
         {
@@ -348,16 +381,26 @@ ExecutionContext::ExecutionContext(const Program& program,
     }
 }
 
-ExecutionContext::~ExecutionContext() = default;
+ExecutionContext::~ExecutionContext()
+{
+    try
+    {
+        drain();
+    }
+    catch (...)
+    {
+    }
+}
 
 void ExecutionContext::set_session_resources(std::shared_ptr<const ResidencySet> resources)
 {
-    detail::require(!impl_->running, "Cannot replace in-flight Metal session resources");
-    // Completion is synchronous. Drop the previous stream's transient backing
-    // references before releasing its persistent cache residency.
-    [impl_->transient removeAllAllocations];
-    [impl_->transient commit];
-    impl_->transient_allocations = [NSSet new];
+    drain();
+    for (auto& slot : impl_->slots)
+    {
+        [slot.transient removeAllAllocations];
+        [slot.transient commit];
+        slot.transient_allocations = [NSSet new];
+    }
     if (@available(macOS 26.0, *))
     {
         if (resources != impl_->session)
@@ -425,6 +468,7 @@ Pipeline Program::resolve(std::string_view name) const
                 function.library = impl_->library;
                 function.name = key;
                 MTL4ComputePipelineDescriptor* descriptor = [MTL4ComputePipelineDescriptor new];
+                descriptor.label = key;
                 descriptor.computeFunctionDescriptor = function;
                 NSError* error = nil;
                 pipeline = [context().compiler newComputePipelineStateWithDescriptor:descriptor
@@ -443,6 +487,8 @@ Pipeline Program::resolve(std::string_view name) const
             result.impl_ = std::make_shared<Pipeline::Impl>();
             result.impl_->pipeline = pipeline;
             result.impl_->kernel = name;
+            result.impl_->max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+            result.impl_->contract = abi::find_kernel_contract(name);
             return result;
         }
         else
@@ -454,11 +500,18 @@ Pipeline Program::resolve(std::string_view name) const
 
 void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
 {
+    drain();
+    wait(submit(dispatches));
+}
+
+ExecutionContext::Ticket ExecutionContext::submit(std::span<const Program::Dispatch> dispatches)
+{
     @autoreleasepool
     {
         if (@available(macOS 26.0, *))
         {
-            detail::require(!impl_->running, "Metal execution context has an exclusive owner");
+            auto& slot = impl_->slots[(impl_->next_ticket - 1) % impl_->slots.size()];
+            wait(slot.ticket);
             const auto& program = impl_->program;
             detail::require(program.impl_ != nullptr, "Metal program is not initialized");
             auto& stats = *program.impl_;
@@ -467,12 +520,18 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
             const auto started = stats.profile ? Clock::now() : Clock::time_point{};
             // A conservative arena allocation policy, separate from the scalar wire layouts.
             constexpr std::size_t parameter_alignment = 256;
+            const auto contract_for = [](const Program::Dispatch& dispatch)
+            {
+                return dispatch.prepared && dispatch.prepared->impl_
+                           ? dispatch.prepared->impl_->contract
+                           : abi::find_kernel_contract(dispatch.kernel);
+            };
             std::size_t active = 0;
             for (const auto& dispatch : dispatches)
             {
                 if (dispatch.threads)
                 {
-                    const auto* contract = abi::find_kernel_contract(dispatch.kernel);
+                    const auto* contract = contract_for(dispatch);
                     detail::require(contract != nullptr, "Unknown Metal kernel ABI");
                     detail::require(!dispatch.parameters.empty() &&
                                         dispatch.parameters.size() <= parameter_alignment &&
@@ -483,17 +542,21 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
             }
             if (!active)
             {
-                return;
+                return 0;
             }
             const auto bytes = checked_mul(active, parameter_alignment);
-            if (!impl_->parameters || impl_->parameters->size() < bytes)
+            if (!slot.parameters || slot.parameters->size() < bytes)
             {
-                impl_->parameters = Buffer::allocate(std::bit_ceil(bytes));
+                slot.parameters = Buffer::allocate(std::bit_ceil(bytes));
             }
-            const auto& arena = *impl_->parameters;
+            const auto& arena = *slot.parameters;
+            const auto validated = stats.profile ? Clock::now() : Clock::time_point{};
             // Keep every backing allocation alive, including allocations reached through views.
             NSMutableSet<id<MTLBuffer>>* allocations = [NSMutableSet new];
             [allocations addObject:arena.impl_->buffer];
+            auto& seen = slot.seen_allocations;
+            seen.clear();
+            seen.insert(arena.impl_->gpu_address);
             for (const auto& dispatch : dispatches)
             {
                 if (!dispatch.threads)
@@ -510,9 +573,15 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                     mask |= 1u << argument.index;
                     detail::require(argument.buffer.impl_ != nullptr,
                                     "Metal kernel received an empty buffer");
-                    [allocations addObject:argument.buffer.impl_->buffer];
+                    // Most bindings repeat the same model, cache, and scratch
+                    // allocations thousands of times. Cross into Foundation
+                    // only once per backing allocation, including buffer views.
+                    if (seen.insert(argument.buffer.impl_->gpu_address).second)
+                    {
+                        [allocations addObject:argument.buffer.impl_->buffer];
+                    }
                 }
-                const auto* contract = abi::find_kernel_contract(dispatch.kernel);
+                const auto* contract = contract_for(dispatch);
                 detail::require(mask == (contract->resource_mask | 1u),
                                 "Metal kernel resource bindings do not match its ABI");
             }
@@ -527,30 +596,32 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                 [allocations minusSet:impl_->session->impl_->allocations];
             }
             bool residency_changed = false;
-            for (id<MTLBuffer> allocation in impl_->transient_allocations)
+            for (id<MTLBuffer> allocation in slot.transient_allocations)
             {
                 if (![allocations containsObject:allocation])
                 {
-                    [impl_->transient removeAllocation:allocation];
+                    [slot.transient removeAllocation:allocation];
                     residency_changed = true;
                 }
             }
             for (id<MTLBuffer> allocation in allocations)
             {
-                if (![impl_->transient_allocations containsObject:allocation])
+                if (![slot.transient_allocations containsObject:allocation])
                 {
-                    [impl_->transient addAllocation:allocation];
+                    [slot.transient addAllocation:allocation];
                     residency_changed = true;
                 }
             }
             if (residency_changed)
             {
-                [impl_->transient commit];
-                impl_->transient_allocations = [allocations copy];
+                [slot.transient commit];
+                slot.transient_allocations = [allocations copy];
             }
             // Resolve and validate every dispatch before opening the command
             // buffer, so invalid work cannot leave a half-recorded context.
-            std::vector<Pipeline> pipelines;
+            const auto resident = stats.profile ? Clock::now() : Clock::time_point{};
+            auto& pipelines = slot.pipelines;
+            pipelines.clear();
             pipelines.reserve(active);
             for (const auto& dispatch : dispatches)
             {
@@ -563,13 +634,10 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                 const auto& handle = pipelines.back();
                 detail::require(handle.impl_ && handle.impl_->kernel == dispatch.kernel,
                                 "Prepared Metal pipeline does not match the dispatch ABI");
-                const auto width =
-                    dispatch.threadgroup_width
-                        ? dispatch.threadgroup_width
-                        : std::min<NSUInteger>(handle.impl_->pipeline.maxTotalThreadsPerThreadgroup,
-                                               256);
-                detail::require(width &&
-                                    width <= handle.impl_->pipeline.maxTotalThreadsPerThreadgroup &&
+                const auto width = dispatch.threadgroup_width
+                                       ? dispatch.threadgroup_width
+                                       : std::min<std::size_t>(handle.impl_->max_threads, 256);
+                detail::require(width && width <= handle.impl_->max_threads &&
                                     (!dispatch.threadgroup_width || dispatch.threads % width == 0),
                                 "Invalid Metal threadgroup width or incomplete barrier group");
                 const auto& groups = dispatch.groups;
@@ -589,12 +657,13 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                     detail::require(!groups[1] && !groups[2], "Incomplete Metal threadgroup grid");
                 }
             }
-            // Previous run has completed before returning, including GPU errors.
-            [impl_->allocator reset];
-            const auto command = impl_->command;
-            const auto table = impl_->table;
-            [command beginCommandBufferWithAllocator:impl_->allocator];
-            [command useResidencySet:impl_->transient];
+            // Only this slot must have completed before its command memory is reused.
+            const auto prepared = stats.profile ? Clock::now() : Clock::time_point{};
+            [slot.allocator reset];
+            const auto command = slot.command;
+            const auto table = slot.table;
+            [command beginCommandBufferWithAllocator:slot.allocator];
+            [command useResidencySet:slot.transient];
             id<MTL4ComputeCommandEncoder> encoder = [command computeCommandEncoder];
             if (!encoder)
             {
@@ -602,10 +671,14 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                 throw Error("Cannot allocate Metal 4 compute encoder");
             }
             [encoder setArgumentTable:table];
+            encoder.label = string(stats.label);
             [encoder barrierAfterQueueStages:MTLStageDispatch
                                 beforeStages:MTLStageDispatch
                            visibilityOptions:MTL4VisibilityOptionDevice];
             std::size_t parameter_index = 0;
+            auto* parameter_bytes = arena.mapped_bytes().data();
+            const auto parameter_address = arena.impl_->gpu_address + arena.offset_;
+            std::array<MTLGPUAddress, 31> bound_addresses{};
             for (const auto& dispatch : dispatches)
             {
                 const auto threads = dispatch.threads,
@@ -616,10 +689,9 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                 }
                 const auto& handle = pipelines[parameter_index];
                 id<MTLComputePipelineState> pipeline = handle.impl_->pipeline;
-                const auto width =
-                    threadgroup_width
-                        ? threadgroup_width
-                        : std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup, 256);
+                const auto width = threadgroup_width
+                                       ? threadgroup_width
+                                       : std::min<std::size_t>(handle.impl_->max_threads, 256);
                 if (parameter_index)
                 {
                     [encoder barrierAfterEncoderStages:MTLStageDispatch
@@ -627,15 +699,18 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
                                      visibilityOptions:MTL4VisibilityOptionDevice];
                 }
                 const auto offset = parameter_index++ * parameter_alignment;
-                arena.slice(offset, dispatch.parameters.size())
-                    .write(dispatch.parameters.data(), dispatch.parameters.size());
-                [table setAddress:arena.impl_->buffer.gpuAddress + offset
-                          atIndex:abi::parameter_slot];
+                std::memcpy(parameter_bytes + offset, dispatch.parameters.data(),
+                            dispatch.parameters.size());
+                [table setAddress:parameter_address + offset atIndex:abi::parameter_slot];
                 for (const auto& argument : dispatch.arguments)
                 {
-                    [table setAddress:argument.buffer.impl_->buffer.gpuAddress +
-                                      argument.buffer.offset_
-                              atIndex:argument.index];
+                    const auto address =
+                        argument.buffer.impl_->gpu_address + argument.buffer.offset_;
+                    if (bound_addresses[argument.index] != address)
+                    {
+                        [table setAddress:address atIndex:argument.index];
+                        bound_addresses[argument.index] = address;
+                    }
                 }
                 [encoder setComputePipelineState:pipeline];
                 if (dispatch.groups[0])
@@ -652,42 +727,87 @@ void ExecutionContext::run(std::span<const Program::Dispatch> dispatches)
             }
             [encoder endEncoding];
             [command endCommandBuffer];
-            const auto completion = impl_->completion;
-            __block id<MTL4CommitFeedback> feedback = nil;
+            const auto completion = std::make_shared<Impl::Completion>();
+            slot.completion = completion;
             MTL4CommitOptions* options = [MTL4CommitOptions new];
             [options addFeedbackHandler:^(id<MTL4CommitFeedback> value) {
-              feedback = value;
-              dispatch_semaphore_signal(completion);
+              completion->feedback = value;
+              dispatch_semaphore_signal(completion->semaphore);
             }];
             const id<MTL4CommandBuffer> commands[] = {command};
-            impl_->running = true;
+            slot.ticket = impl_->next_ticket++;
             [impl_->queue commit:commands count:1 options:options];
             const auto committed = stats.profile ? Clock::now() : Clock::time_point{};
-            dispatch_semaphore_wait(completion, DISPATCH_TIME_FOREVER);
-            impl_->running = false;
             if (stats.profile)
             {
                 ++stats.submissions;
                 stats.dispatches += active;
+                const auto elapsed = [](auto first, auto last)
+                {
+                    return static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(last - first).count());
+                };
+                stats.validation_ns += elapsed(started, validated);
+                stats.residency_ns += elapsed(validated, resident);
+                stats.preparation_ns += elapsed(resident, prepared);
+                stats.commands_ns += elapsed(prepared, committed);
                 stats.encoding_ns += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(committed - started)
                         .count());
-                stats.wait_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - committed)
-                        .count());
-                stats.gpu_ns +=
-                    static_cast<std::uint64_t>((feedback.GPUEndTime - feedback.GPUStartTime) * 1e9);
             }
-            if (feedback.error)
-            {
-                throw Error("Metal 4 command failed: " +
-                            message(feedback.error, "unknown command error"));
-            }
+            return slot.ticket;
         }
         else
         {
             throw Error("Metal 4 requires macOS 26 or later");
         }
     }
+}
+
+void ExecutionContext::wait(Ticket ticket)
+{
+    if (!ticket || ticket <= impl_->retired)
+    {
+        return;
+    }
+    detail::require(ticket < impl_->next_ticket, "Unknown Metal submission ticket");
+    std::exception_ptr failure;
+    if (@available(macOS 26.0, *))
+    {
+        while (impl_->retired < ticket)
+        {
+            auto& slot = impl_->slots[impl_->retired % impl_->slots.size()];
+            auto& stats = *impl_->program.impl_;
+            const auto started = std::chrono::steady_clock::now();
+            dispatch_semaphore_wait(slot.completion->semaphore, DISPATCH_TIME_FOREVER);
+            const auto feedback = slot.completion->feedback;
+            if (stats.profile)
+            {
+                stats.wait_ns +=
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - started)
+                                                   .count());
+                stats.gpu_ns +=
+                    static_cast<std::uint64_t>((feedback.GPUEndTime - feedback.GPUStartTime) * 1e9);
+            }
+            slot.ticket = 0;
+            slot.completion.reset();
+            ++impl_->retired;
+            if (feedback.error && !failure)
+            {
+                failure = std::make_exception_ptr(Error(
+                    "Metal 4 command failed: " + message(feedback.error, "unknown command error")));
+            }
+        }
+    }
+    if (failure)
+    {
+        std::rethrow_exception(failure);
+    }
+}
+
+void ExecutionContext::drain()
+{
+    wait(impl_->next_ticket - 1);
 }
 } // namespace tsac::metal

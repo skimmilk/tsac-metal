@@ -4,6 +4,7 @@
 #include "session.hpp"
 
 #include <algorithm>
+#include <deque>
 
 namespace tsac::metal::transformer
 {
@@ -37,6 +38,25 @@ std::vector<std::uint16_t> Session::decode(ByteView stream, const EntropyObserve
     auto probabilities = Buffer::allocate(count * 2048, BufferStorage::gpu_only),
          trees = Buffer::allocate(count * 4096, BufferStorage::gpu_only);
     auto& graph = recorder;
+
+    // Complete queued GPU consumers before local buffers leave scope, including
+    // observer exceptions and errors encountered while recording the next chunk.
+    struct DrainOnExit
+    {
+        Prediction& graph;
+
+        ~DrainOnExit()
+        {
+            try
+            {
+                graph.drain();
+            }
+            catch (...)
+            {
+            }
+        }
+    } drain_on_exit{graph};
+
     const auto steps = h.frames / h.batch + (h.frames % h.batch != 0);
     std::size_t context = 0, chunk_start = 0, chunk_steps = 0;
     graph.begin();
@@ -76,12 +96,40 @@ std::vector<std::uint16_t> Session::decode(ByteView stream, const EntropyObserve
             }
         }
     };
+
+    struct Pending
+    {
+        Prediction::Ticket ticket;
+        std::size_t first, end;
+    };
+
+    std::deque<Pending> pending;
+    const auto complete = [&]
+    {
+        const auto chunk = pending.front();
+        graph.wait(chunk.ticket);
+        pending.pop_front();
+        publish(chunk.first, chunk.end);
+    };
+    const auto drain = [&]
+    {
+        while (!pending.empty())
+        {
+            complete();
+        }
+    };
     const auto flush = [&](std::size_t end)
     {
         if (chunk_steps)
         {
-            graph.finish();
-            publish(chunk_start, end);
+            const auto ticket = graph.submit();
+            pending.push_back({ticket, chunk_start, end});
+            // Two submissions may be committed together. Reclaim the oldest
+            // slot before recording into its CPU-written memory again.
+            if (pending.size() == 2)
+            {
+                complete();
+            }
             chunk_steps = 0;
         }
         graph.begin();
@@ -96,6 +144,7 @@ std::vector<std::uint16_t> Session::decode(ByteView stream, const EntropyObserve
         if (replay)
         {
             flush(step);
+            drain();
             // Rollover feeds exactly the last 256 complete token frames with
             // the original replay rounding. Bound recording/scratch even here.
             for (std::size_t lane = 0; lane < active; ++lane)
@@ -211,6 +260,7 @@ std::vector<std::uint16_t> Session::decode(ByteView stream, const EntropyObserve
             flush(step + 1);
         }
     }
+    drain();
     tokens.read(output.data(), output.size() * 2);
     verify_token_crc(h, output);
     return output;

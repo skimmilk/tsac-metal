@@ -32,6 +32,8 @@ public:
     Buffer slice(std::size_t offset, std::size_t bytes) const;
     std::size_t size() const;
     bool shares_storage(const Buffer& other) const;
+    // Equality includes the backing allocation, offset, and logical length.
+    bool operator==(const Buffer& other) const = default;
     std::span<std::byte> mapped_bytes() const;
     // Borrow CPU-visible storage after completion. The Buffer retains ownership;
     // the view remains valid until its last backing owner is released.
@@ -120,18 +122,27 @@ private:
     friend class ExecutionContext;
 };
 
-// One exclusive recording owner. Reuses command memory, argument bindings and
-// constant storage after synchronous completion. Model and session residency
-// are stable; only changed transient allocations update the working set.
+// One exclusive CPU recording owner, one queue, and at most two outstanding
+// submissions. Each slot retains command memory, constants and resources until
+// completion. Model and session residency remain shared between submissions.
 class ExecutionContext
 {
 public:
+    using Ticket = std::uint64_t;
     explicit ExecutionContext(const Program& program,
                               std::shared_ptr<const ResidencySet> model = {});
     ~ExecutionContext();
     ExecutionContext(const ExecutionContext&) = delete;
     ExecutionContext& operator=(const ExecutionContext&) = delete;
     void set_session_resources(std::shared_ptr<const ResidencySet> resources);
+    // Encode and commit before returning; empty work returns zero.
+    // Dispatch descriptions may be reused after this call;
+    // buffer ownership is retained, but the CPU must not rewrite input contents
+    // or read GPU results until the ticket completes. A third submit waits for
+    // the oldest slot. wait() completes all tickets through the requested one.
+    Ticket submit(std::span<const Program::Dispatch> dispatches);
+    void wait(Ticket ticket);
+    void drain();
     void run(std::span<const Program::Dispatch> dispatches);
 
 private:
